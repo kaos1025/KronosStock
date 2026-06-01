@@ -1,0 +1,71 @@
+# ── Secrets & credentials (NEVER COMMIT) ─────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token
+# python-kis caches the OAuth2 access token to disk (24h validity)
+.cache/
+*.token.json
+kis_token*.json
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Jupyter ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+notebooks/*.html
+
+# ── Model weights & data (large / regenerable) ───────────────────────
+# Vendored Kronos 패키지 (inference/vendor_kronos.sh 로 재생성 — 커밋 금지, 용량 큼)
+/model/
+# HuggingFace 가중치 캐시 (.cache/ 도 이미 무시되지만 명시)
+.cache/huggingface/
+*.pt
+*.pth
+*.bin
+*.safetensors
+models/
+weights/
+checkpoints/
+data/
+*.parquet
+# Redis snapshot
+dump.rdb
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS / IDE ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ── Tooling (oh-my-claudecode 세션 상태) ──────────────────────────────
+.omc/

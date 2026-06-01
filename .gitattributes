@@ -1,0 +1,5 @@
+# 텍스트 파일 줄바꿈은 repo 에 LF 로 정규화(크로스플랫폼 일관성)
+* text=auto
+
+# 셸 스크립트는 반드시 LF — Docker/Linux 에서 실행되므로 CRLF 면 깨진다
+*.sh text eol=lf

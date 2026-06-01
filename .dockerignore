@@ -1,0 +1,38 @@
+# Keep the build context lean and never leak secrets into an image layer
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+# python-kis on-disk OAuth token cache (mirror .gitignore)
+.cache/
+*.token
+*.token.json
+kis_token*.json
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+notebooks/
+*.log
+logs/
+data/
+model/
+models/
+weights/
+checkpoints/
+dump.rdb
+
+# OMC / Claude tooling — not needed in the image
+.omc/
+.claude/
+
+README.md
+*.md

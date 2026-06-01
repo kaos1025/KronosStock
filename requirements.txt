@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────
+# KronosStock — Python 3.11.  Pins verified against PyPI on 2026-06-01.
+# NOTE: local Python here is 3.13; the authoritative resolve check is
+#       `docker build` against python:3.11-slim (see Dockerfile).
+# ─────────────────────────────────────────────────────────────────────
+
+# ── 한국투자증권 Open API (primary data + orders) ──
+python-kis==2.1.6
+
+# ── Free historical / KRX backup data sources ──
+finance-datareader==0.9.202
+pykrx==1.2.8
+
+# ── Data core ──
+#   pykrx 1.2.8 pins pandas<3.0,>=2.2.0 → pandas MUST stay on the 2.x line.
+#   2.3.3 satisfies pykrx and is compatible with Kronos (needs >=2.2).
+pandas==2.3.3
+numpy==2.4.6
+
+# ── Kronos-mini inference ──
+#   CPU-only torch wheel (Hetzner CX22 has no GPU); ~10x smaller than the
+#   default CUDA wheel. The +cpu local version only exists on the PyTorch
+#   index, so this EXACT pin unambiguously selects the CPU build.
+#   ⚠️ DO NOT relax to a non-'+cpu' spec (e.g. torch==2.5.1): with the extra
+#      index that could resolve the ~3GB CUDA build from PyPI instead.
+#      (A sole --index-url to the torch index would break on torch's general
+#       deps like sympy/jinja2, so --extra-index-url is the correct form here.)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+einops==0.8.1
+huggingface_hub==0.33.1
+safetensors==0.6.2
+tqdm==4.67.1
+matplotlib==3.9.3        # notebook backtest plots
+#   NOTE: Kronos 는 huggingface_hub.PyTorchModelHubMixin 으로 from_pretrained 를 제공한다
+#         → 'transformers' 불필요(Kronos requirements.txt 에도 없음). 추가 금지.
+#   (위 핀은 vendoring 되는 Kronos requirements.txt 와 일치. pandas 만 pykrx<3.0 제약상
+#    Kronos 의 ==2.2.2 대신 호환 범위 내 2.3.3 으로 통일.)
+
+# ── KR 장 휴장일 캘린더 (예측 미래 타임스탬프 정확도) ──
+#   XKRX = 한국거래소 캘린더(음력/대체공휴일/임시휴장 자동 반영).
+#   pandas>=1.5 / numpy>=1.26 만 요구(상한 없음) → 2.3.3 / 2.4.6 와 호환.
+exchange-calendars==4.13.2
+
+# ── Web / API (local dashboard) ──
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+
+# ── Buffer (shareable with KronosKit via key prefix) ──
+redis==8.0.0
+
+# ── Scheduler (3.x stable; 4.x is alpha-only) ──
+APScheduler==3.11.2
+
+# ── Telegram alerts (async API since v20) ──
+python-telegram-bot==22.7
+
+# ── Config / HTTP ──
+pydantic==2.13.4
+pydantic-settings==2.14.1
+python-dotenv==1.2.2
+httpx==0.28.1

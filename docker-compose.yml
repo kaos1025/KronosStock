@@ -1,0 +1,36 @@
+# KronosStock 로컬/서버 실행.  KronosKit 과 동일 Hetzner CX22 에 추가 가능.
+services:
+  redis:
+    image: redis:7-alpine
+    # KronosKit 의 Redis 를 공유한다면 이 서비스를 제거하고
+    # app 의 REDIS_URL 을 공유 인스턴스 주소로 지정한다.
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Seoul
+      # compose 네트워크 내부에서 redis 서비스로 연결(.env 의 REDIS_URL 을 덮어씀)
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    ports:
+      - "8000:8000"
+    volumes:
+      # 이름 있는 볼륨은 이미지의 uid-1000 소유권을 상속한다.
+      # (호스트 bind-mount 는 새 리눅스 호스트에서 root 소유로 생성되어
+      #  비루트 컨테이너가 토큰 캐시/로그를 못 쓰는 문제가 있다)
+      - kis-cache:/app/.cache
+      - app-logs:/app/logs
+    command: ["uvicorn", "dashboard.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  redis-data:
+  kis-cache:
+  app-logs:
