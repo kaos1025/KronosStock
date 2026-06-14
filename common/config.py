@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     kis_token_dir: str = ".cache"   # 토큰 캐시 디렉터리(compose 의 kis-cache 볼륨에 매핑)
     kis_use_websocket: bool = False  # 실시간 웹소켓(불필요하면 끈다 → REST 폴링만)
 
+    # ── 토스증권 Open API read-only market data ──
+    market_data_provider: str = "kis"  # kis | toss | fdr | auto
+    tossinvest_client_id: str = ""
+    tossinvest_client_secret: str = ""
+    tossinvest_base_url: str = "https://openapi.tossinvest.com"
+    tossinvest_timeout: float = 10.0
+
     # ── Redis (KronosKit 과 인스턴스 공유 가능 → 키 prefix 로 네임스페이스 분리) ──
     redis_url: str = "redis://localhost:6379/0"
     redis_password: str = ""
@@ -100,6 +107,11 @@ class Settings(BaseSettings):
     def kis_virtual_configured(self) -> bool:
         """모의투자 자격증명이 모두 채워졌는지(모의 주문 가능 여부)."""
         return all((self.kis_virtual_appkey, self.kis_virtual_appsecret, self.kis_virtual_account))
+
+    @property
+    def tossinvest_configured(self) -> bool:
+        """토스증권 Open API client credentials 설정 여부."""
+        return bool(self.tossinvest_client_id and self.tossinvest_client_secret)
 
     @property
     def telegram_configured(self) -> bool:

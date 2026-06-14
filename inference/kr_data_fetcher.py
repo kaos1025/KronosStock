@@ -100,6 +100,23 @@ def fetch_daily_ohlcv(
     """
     if days is None:
         days = settings.forecast_lookback_days
+    provider = settings.market_data_provider.lower()
+    if provider == "toss":
+        try:
+            return _fetch_toss(code, days=days, start=start, end=end)
+        except Exception as exc:  # noqa: BLE001 - 폴백을 위해 광범위 캐치
+            logger.warning(
+                "Toss OHLCV 조회 실패(code=%s): %s → FinanceDataReader 폴백", code, exc
+            )
+            return _fetch_fdr(code, days=days, start=start, end=end)
+    if provider == "fdr":
+        return _fetch_fdr(code, days=days, start=start, end=end)
+    if provider == "auto" and settings.tossinvest_configured:
+        try:
+            return _fetch_toss(code, days=days, start=start, end=end)
+        except Exception as exc:  # noqa: BLE001 - KIS/FDR 폴백을 위해 광범위 캐치
+            logger.warning("Toss OHLCV 조회 실패(code=%s): %s → KIS/FDR 폴백", code, exc)
+
     try:
         return _fetch_kis(code, days=days, start=start, end=end)
     except Exception as exc:  # noqa: BLE001 - 폴백을 위해 광범위 캐치
@@ -107,6 +124,12 @@ def fetch_daily_ohlcv(
             "KIS OHLCV 조회 실패(code=%s): %s → FinanceDataReader 폴백", code, exc
         )
         return _fetch_fdr(code, days=days, start=start, end=end)
+
+
+def _fetch_toss(code: str, *, days: int, start: Optional[date], end: Optional[date]) -> pd.DataFrame:
+    from inference import toss_data_fetcher
+
+    return toss_data_fetcher.fetch_daily_ohlcv(code, days=days, start=start, end=end)
 
 
 def _fetch_kis(code: str, *, days: int, start: Optional[date], end: Optional[date]) -> pd.DataFrame:

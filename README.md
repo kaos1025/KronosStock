@@ -44,6 +44,20 @@ docker compose up --build
 - 토큰은 24h 유효. `KIS_KEEP_TOKEN=true`로 디스크 캐시(과다발급 시 KIS 사용제한).
 - 레이트리밋: 실전 20 req/s, 모의 5 req/s.
 
+## Toss Open API 시세 provider
+토스증권 Open API를 read-only market data provider로 사용할 수 있다. 주문 API는 연결하지 않는다.
+```env
+MARKET_DATA_PROVIDER=toss
+TOSSINVEST_CLIENT_ID=...
+TOSSINVEST_CLIENT_SECRET=...
+```
+현재 사용 endpoint:
+- `POST /oauth2/token` — OAuth2 client credentials access token 발급/캐시
+- `GET /api/v1/candles?symbol=005930&interval=1d` — 일봉 OHLCV 조회
+- `GET /api/v1/prices?symbols=005930,000660` — 현재가 조회(optional)
+
+토스 캔들 응답에는 거래대금(`amount`) 필드가 없어 Redis OHLCV 표준 스키마에는 `amount=0.0`으로 저장한다.
+
 ## 예측 파이프라인 (Kronos)
 
 ### 1) 모델 vendoring (추론 전 1회)
