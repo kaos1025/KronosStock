@@ -5,10 +5,13 @@
 """
 from __future__ import annotations
 
-from fastapi import FastAPI
+import json
+
+from fastapi import FastAPI, HTTPException
 
 from common.config import settings
-from common.redis_client import ping as redis_ping
+from common.redis_client import get_redis, key, ping as redis_ping
+from strategy.analyzer import analyze_forecast
 
 app = FastAPI(title="KronosStock", version="0.1.0")
 
@@ -31,3 +34,19 @@ def status() -> dict:
         "model": settings.kronos_model_repo,
         "device": settings.kronos_device,
     }
+
+
+@app.get("/forecast/{code}")
+def forecast(code: str) -> dict:
+    """Redis 에 저장된 forecast payload 조회(비밀값 노출 없음)."""
+    raw = get_redis().get(key("forecast", "daily", code))
+    if not raw:
+        raise HTTPException(status_code=404, detail=f"forecast not found: {code}")
+    return json.loads(raw)
+
+
+@app.get("/signal/{code}")
+def signal(code: str) -> dict:
+    """저장된 forecast payload 를 BUY/HOLD/SELL 시그널로 변환."""
+    payload = forecast(code)
+    return analyze_forecast(payload).as_dict()
