@@ -68,8 +68,8 @@ def calculate_metrics(
 
 
 def backtest_threshold_signal(
-    close: Sequence[float] | pd.Series,
-    predicted_return: Sequence[float] | pd.Series,
+    close: Sequence[float] | pd.Series | np.ndarray,
+    predicted_return: Sequence[float] | pd.Series | np.ndarray,
     *,
     entry_threshold: float = 0.02,
     initial_cash: float = 1_000_000.0,
@@ -79,9 +79,15 @@ def backtest_threshold_signal(
     predicted_return[t] >= entry_threshold 이면 close[t]→close[t+1] 수익률을
     1일 long 으로 반영하고, 아니면 현금 유지한다(look-ahead 회피).
 
+    단순 검증용 모델이므로 진입/청산은 같은 close 라벨의 다음 구간 수익률로 표현한다.
+    실제 운용/모의투자에서는 slippage, 수수료, open[t+1] 진입, Market-On-Close 체결
+    가능성 등을 별도 모델링해야 한다. 포지션 사이징도 의도적으로 매 진입마다 현재
+    equity 의 100%를 투입하는 전액 복리 가정이다.
+
     Parameters
     ----------
     close : 종가 시계열. pandas Series 면 index 를 거래 날짜 라벨로 사용한다.
+        list/tuple/numpy.ndarray 입력은 0부터 시작하는 정수 라벨을 사용한다.
     predicted_return : 각 시점의 예측 수익률(close 와 같은 길이).
     entry_threshold : 진입 임계값(기본 0.02 = +2%).
     initial_cash : 시작 자본.

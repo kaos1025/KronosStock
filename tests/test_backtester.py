@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -91,9 +92,60 @@ def test_accepts_plain_sequences():
     assert res.win_rate == pytest.approx(1.0)
 
 
+def test_accepts_numpy_arrays():
+    # Gemini review nit: runtime 이 이미 지원하는 np.ndarray 입력을 명시 검증.
+    res = backtest_threshold_signal(
+        np.array([100.0, 105.0, 102.0]),
+        np.array([0.03, -0.01, 0.0]),
+        entry_threshold=0.02,
+    )
+    assert len(res.trades) == 1
+    assert res.trades[0]["entry_date"] == 0
+    assert res.trades[0]["exit_date"] == 1
+    assert res.total_return == pytest.approx(0.05)
+
+
 def test_length_mismatch_raises():
     with pytest.raises(ValueError):
         backtest_threshold_signal([100.0, 110.0], [0.05])
+
+
+def test_zero_entry_price_defensive_branch():
+    # 0원 entry_price 는 비현실적 입력이지만, 방어 분기가 손익 0으로 안전 처리해야 한다.
+    res = backtest_threshold_signal([0.0, 10.0], [0.05, 0.0], entry_threshold=0.02)
+    assert len(res.trades) == 1
+    assert res.trades[0]["entry_price"] == pytest.approx(0.0)
+    assert res.trades[0]["exit_price"] == pytest.approx(10.0)
+    assert res.trades[0]["return"] == pytest.approx(0.0)
+    assert res.total_return == pytest.approx(0.0)
+    assert res.max_drawdown == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("close", "predicted_return"),
+    [([], []), ([100.0], [0.05])],
+)
+def test_empty_or_single_point_data_is_safe_cash_only(close, predicted_return):
+    # 다음 close 가 없는 입력은 거래 없이 시작 자본을 보존한다.
+    res = backtest_threshold_signal(close, predicted_return, entry_threshold=0.02)
+    assert res.trades == []
+    assert res.equity_curve == [1_000_000.0]
+    assert res.total_return == pytest.approx(0.0)
+    assert res.win_rate == pytest.approx(0.0)
+    assert res.max_drawdown == pytest.approx(0.0)
+
+
+def test_all_loss_trades_have_zero_win_rate():
+    res = backtest_threshold_signal(
+        [100.0, 90.0, 80.0],
+        [0.05, 0.05, 0.0],
+        entry_threshold=0.02,
+    )
+    assert len(res.trades) == 2
+    assert all(trade["return"] < 0.0 for trade in res.trades)
+    assert res.win_rate == pytest.approx(0.0)
+    assert res.total_return == pytest.approx(-0.2)
+    assert res.max_drawdown == pytest.approx(-0.2)
 
 
 def test_calculate_metrics_standalone():
