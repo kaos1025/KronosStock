@@ -1,0 +1,16 @@
+[Unit]
+Description=KronosStock read-only forecast and paper dry-run
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/srv/agent-workspaces/KronosStock
+ExecStart=/srv/kronostock/dry-run-once.sh
+TimeoutStartSec=900
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

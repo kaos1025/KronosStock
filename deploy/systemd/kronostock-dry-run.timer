@@ -1,0 +1,13 @@
+[Unit]
+Description=Run KronosStock dry-run on KST market schedule
+
+[Timer]
+OnCalendar=Mon..Fri 08:50:00
+OnCalendar=Mon..Fri 09:30:00
+OnCalendar=Mon..Fri 12:00:00
+OnCalendar=Mon..Fri 15:20:00
+Persistent=true
+Unit=kronostock-dry-run.service
+
+[Install]
+WantedBy=timers.target

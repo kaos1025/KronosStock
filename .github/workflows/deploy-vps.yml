@@ -1,0 +1,91 @@
+name: Deploy KronosStock VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-kronostock-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Trust VPS host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.VPS_PORT || 22 }}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy KronosStock
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT || 22 }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_REF: ${{ github.sha }}
+          APP_DIR: /srv/agent-workspaces/KronosStock
+        run: |
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' APP_DIR='$APP_DIR' bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          cd "$APP_DIR"
+          git fetch origin main
+          git checkout main
+          git reset --hard "$DEPLOY_REF"
+          # Preserve server-local secrets, venv, downloaded model code, and caches.
+          git clean -fd \
+            -e .env \
+            -e .venv/ \
+            -e model/ \
+            -e .pytest_cache/ \
+            -e '**/__pycache__/'
+
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+
+          if ! command -v python3.11 >/dev/null 2>&1; then
+            echo "python3.11 is required on the VPS" >&2
+            exit 1
+          fi
+
+          if [ ! -d .venv ]; then
+            uv venv --python python3.11 .venv
+          fi
+          . .venv/bin/activate
+          uv pip install --index-strategy unsafe-best-match -r requirements.txt -r requirements-dev.txt
+
+          bash inference/vendor_kronos.sh
+          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('vendored model import OK')"
+          python -m pytest tests/ -q
+
+          test -f .env
+          test "$(stat -c '%a' .env)" = "600"
+          redis-cli ping | grep -q '^PONG$'
+
+          sudo install -d -o deploy -g deploy -m 755 /srv/kronostock /srv/logs/kronostock
+          sudo install -o deploy -g deploy -m 755 scripts/deploy/kronostock-dry-run-once.sh /srv/kronostock/dry-run-once.sh
+          sudo install -m 644 deploy/systemd/kronostock-dry-run.service /etc/systemd/system/kronostock-dry-run.service
+          sudo install -m 644 deploy/systemd/kronostock-dry-run.timer /etc/systemd/system/kronostock-dry-run.timer
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now kronostock-dry-run.timer
+          sudo systemctl restart kronostock-dry-run.timer
+
+          systemctl is-active kronostock-dry-run.timer
+          systemctl list-timers kronostock-dry-run.timer --no-pager
+          git status --short --branch
+          REMOTE
