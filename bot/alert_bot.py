@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from common.config import settings
+from common.symbols import display_symbol
 from strategy.analyzer import SignalAction, TradeSignal
 from strategy.paper_trader import PaperOrder, PaperPortfolio
 
@@ -20,7 +21,7 @@ def format_signal(signal: TradeSignal) -> str:
         SignalAction.SELL: "🔴",
     }[signal.action]
     return (
-        f"{emoji} *{signal.code}* `{signal.action.value}`\n"
+        f"{emoji} *{display_symbol(signal.code)}* `{signal.action.value}`\n"
         f"예상수익률: {signal.expected_return:+.2%}\n"
         f"상승확률: {signal.up_probability:.0%}\n"
         f"목표가: {signal.target_price:,.0f} / 현재가: {signal.last_close:,.0f}\n"
@@ -46,7 +47,7 @@ def format_orders(orders: Iterable[PaperOrder], portfolio: PaperPortfolio | None
     lines = ["🧾 *Paper trading 체결*\n"]
     for order in items:
         lines.append(
-            f"- `{order.side.value}` {order.code} x {order.quantity:,} "
+            f"- `{order.side.value}` {display_symbol(order.code)} x {order.quantity:,} "
             f"@ {order.price:,.0f} = {order.notional:,.0f}"
         )
     if portfolio is not None:

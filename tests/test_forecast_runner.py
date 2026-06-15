@@ -185,6 +185,7 @@ def test_days_resolution_backward_compat(monkeypatch):
         return _synthetic_ohlcv(10)
 
     monkeypatch.setattr(kr_data_fetcher, "_fetch_kis", fake_kis)
+    monkeypatch.setattr(kr_data_fetcher.settings, "market_data_provider", "kis")
 
     kr_data_fetcher.fetch_daily_ohlcv("005930")  # None → config
     assert captured["days"] == kr_data_fetcher.settings.forecast_lookback_days

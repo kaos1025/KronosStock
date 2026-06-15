@@ -45,10 +45,61 @@ def test_dashboard_forecast_and_signal_endpoints(monkeypatch):
     signal_res = client.get("/signal/005930")
     assert signal_res.status_code == 200
     assert signal_res.json()["action"] == "BUY"
+    assert signal_res.json()["name"] == "삼성전자"
     assert signal_res.json()["expected_return"] == pytest.approx(0.03)
 
     missing_res = client.get("/forecast/000000")
     assert missing_res.status_code == 404
+
+
+def test_dashboard_paper_portfolio_endpoint(monkeypatch):
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    redis.set(
+        "kronos:stock:paper:portfolio",
+        json.dumps(
+            {
+                "cash": 600_000.0,
+                "positions": {"005930": 2000},
+                "orders": [
+                    {
+                        "code": "005930",
+                        "side": "BUY",
+                        "quantity": 2000,
+                        "price": 100.0,
+                        "notional": 200_000.0,
+                        "reason": "test",
+                        "created_at": "2026-06-14T09:00:00+09:00",
+                    }
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(dashboard_app, "get_redis", lambda: redis)
+    client = TestClient(dashboard_app.app)
+
+    res = client.get("/paper/portfolio")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["cash"] == 600_000.0
+    assert body["positions"] == {"005930": 2000}
+    assert body["orders"][0]["code"] == "005930"
+    # 비밀값/토큰이 응답에 새지 않는다.
+    assert "token" not in res.text.lower()
+
+
+def test_dashboard_paper_portfolio_missing_returns_404(monkeypatch):
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(dashboard_app, "get_redis", lambda: redis)
+    client = TestClient(dashboard_app.app)
+
+    res = client.get("/paper/portfolio")
+    assert res.status_code == 404
+
+
+def test_dashboard_paper_portfolio_key_matches_scheduler():
+    from bot import scheduler as sched
+
+    assert dashboard_app.PAPER_PORTFOLIO_KEY == sched.PAPER_PORTFOLIO_KEY
 
 
 def test_alert_formatters_do_not_require_telegram_config():
@@ -60,10 +111,10 @@ def test_alert_formatters_do_not_require_telegram_config():
     digest_text = format_signal_digest([signal])
     order_text = format_orders([order], portfolio) if order is not None else ""
 
-    assert "005930" in signal_text
+    assert "삼성전자 (005930)" in signal_text
     assert "BUY" in signal_text
     assert "KronosStock 시그널" in digest_text
-    assert "Paper trading" in order_text
+    assert "삼성전자 (005930)" in order_text
     assert "TELEGRAM_BOT_TOKEN" not in signal_text
 
 

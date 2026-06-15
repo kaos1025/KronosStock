@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 
 from common.config import settings
 from common.redis_client import get_redis, key, ping as redis_ping
+from common.symbols import symbol_name
 from strategy.analyzer import analyze_forecast
 
 app = FastAPI(title="KronosStock", version="0.1.0")
@@ -49,4 +50,23 @@ def forecast(code: str) -> dict:
 def signal(code: str) -> dict:
     """저장된 forecast payload 를 BUY/HOLD/SELL 시그널로 변환."""
     payload = forecast(code)
-    return analyze_forecast(payload).as_dict()
+    data = analyze_forecast(payload).as_dict()
+    data["name"] = symbol_name(code)
+    return data
+
+
+# scheduler dry-run 이 저장하는 paper portfolio snapshot 키와 동일 네임스페이스.
+PAPER_PORTFOLIO_KEY = key("paper", "portfolio")
+
+
+@app.get("/paper/portfolio")
+def paper_portfolio() -> dict:
+    """scheduler dry-run 이 저장한 paper portfolio snapshot 조회.
+
+    Redis 에 snapshot 이 없으면 404. 비밀값/토큰은 저장하지 않으므로 노출 위험 없음
+    (현금·보유수량·체결기록만 반환).
+    """
+    raw = get_redis().get(PAPER_PORTFOLIO_KEY)
+    if not raw:
+        raise HTTPException(status_code=404, detail="paper portfolio snapshot not found")
+    return json.loads(raw)

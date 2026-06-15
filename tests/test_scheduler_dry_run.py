@@ -118,3 +118,69 @@ def test_create_scheduler_registers_four_dry_run_jobs(monkeypatch):
 def test_parse_hhmm_rejects_invalid_values(value):
     with pytest.raises(ValueError):
         sched._parse_hhmm(value)
+
+
+def test_main_once_defaults_to_dry_run_without_alert(monkeypatch):
+    captured = {}
+
+    def fake_cycle(**kwargs):
+        captured.update(kwargs)
+        return sched.DryRunResult(
+            signals={}, orders=[], portfolio=PaperPortfolio(), message="x", portfolio_key=None
+        )
+
+    monkeypatch.setattr(sched, "run_dry_run_cycle", fake_cycle)
+
+    result = sched.main(["--once"])
+    assert isinstance(result, sched.DryRunResult)
+    assert captured == {"send_alert": False}
+
+
+def test_main_once_send_alert_is_explicit_opt_in(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        sched,
+        "run_dry_run_cycle",
+        lambda **kwargs: captured.update(kwargs)
+        or sched.DryRunResult(
+            signals={}, orders=[], portfolio=PaperPortfolio(), message="x", portfolio_key=None
+        ),
+    )
+
+    sched.main(["--once", "--send-alert"])
+    assert captured == {"send_alert": True}
+
+
+def test_main_default_runs_service_without_alert(monkeypatch):
+    captured = {}
+
+    def fake_service(**kwargs):
+        captured.update(kwargs)
+        return "scheduler-handle"
+
+    monkeypatch.setattr(sched, "run_service", fake_service)
+
+    # 실주문/포그라운드 블로킹 없이 서비스 진입점만 호출되는지 확인.
+    assert sched.main([]) == "scheduler-handle"
+    assert captured == {"send_alert": False}
+
+
+def test_run_service_starts_scheduler_without_blocking_or_alert(monkeypatch):
+    started = {}
+
+    class FakeScheduler:
+        def __init__(self):
+            started["start"] = 0
+
+        def start(self):
+            started["start"] += 1
+
+        def get_jobs(self):
+            return ["a", "b", "c", "d"]
+
+    monkeypatch.setattr(sched, "create_scheduler", lambda *, send_alert: started.setdefault("send_alert", send_alert) or FakeScheduler())
+
+    scheduler = sched.run_service(send_alert=False, block=False)
+    assert isinstance(scheduler, FakeScheduler)
+    assert started["start"] == 1
+    assert started["send_alert"] is False

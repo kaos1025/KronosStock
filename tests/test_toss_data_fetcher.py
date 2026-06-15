@@ -39,6 +39,20 @@ def toss_settings(monkeypatch):
     monkeypatch.setattr(toss_data_fetcher.settings, "tossinvest_timeout", 1.0)
     toss_data_fetcher._TOKEN_CACHE.access_token = ""
     toss_data_fetcher._TOKEN_CACHE.expires_at = 0.0
+
+    # Live local integration tests may leave a real Toss token in Redis.
+    # Unit tests use MockTransport and must stay isolated from shared Redis state.
+    def load_memory_cache(*, now):
+        if toss_data_fetcher._TOKEN_CACHE.access_token and now < toss_data_fetcher._TOKEN_CACHE.expires_at - 60:
+            return toss_data_fetcher._TOKEN_CACHE.access_token
+        return None
+
+    def store_memory_cache(token, *, expires_in, now):
+        toss_data_fetcher._TOKEN_CACHE.access_token = token
+        toss_data_fetcher._TOKEN_CACHE.expires_at = now + expires_in
+
+    monkeypatch.setattr(toss_data_fetcher, "_load_cached_token", load_memory_cache)
+    monkeypatch.setattr(toss_data_fetcher, "_store_cached_token", store_memory_cache)
     yield
     toss_data_fetcher._TOKEN_CACHE.access_token = ""
     toss_data_fetcher._TOKEN_CACHE.expires_at = 0.0

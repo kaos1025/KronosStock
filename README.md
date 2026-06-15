@@ -101,15 +101,40 @@ predictor 가 모델명으로 자동 매핑한다(`config.py` 의 `kronos_*` 값
 **한국 장 휴장일:** `exchange_calendars` 의 `XKRX` 캘린더로 미래 타임스탬프에서 휴장일을 제거한다
 (음력·대체공휴일·임시휴장 자동 반영). 미설치/실패 시 평일(월~금) 기준으로 폴백(경고 로깅).
 
+## 대시보드 엔드포인트
+`uvicorn dashboard.app:app --reload` 로 띄운다. 모든 응답은 **비밀값/토큰 비노출**.
+| Method · Path | 설명 |
+|---|---|
+| `GET /health` | 헬스체크 |
+| `GET /status` | 구성 상태(설정 여부 불리언) + watchlist/model/device |
+| `GET /forecast/{code}` | Redis `kronos:stock:forecast:daily:<code>` payload (없으면 404) |
+| `GET /signal/{code}` | 저장된 forecast → BUY/HOLD/SELL 시그널 변환 |
+| `GET /paper/portfolio` | scheduler dry-run 이 저장한 paper portfolio snapshot (없으면 404) |
+
+`/paper/portfolio` 는 scheduler 와 동일 키(`kronos:stock:paper:portfolio`)의 현금·보유수량·체결기록만 반환한다.
+
+## 자동화 dry-run 러너 (scheduler)
+`bot/scheduler.py` 는 **forecast → signal → paper order → digest** 를 1회 수행하는 안전한 자동화다.
+**실제 KIS/broker 주문 API 는 호출하지 않으며**, Telegram 전송은 `--send-alert` opt-in 일 때만 동작한다.
+```bash
+python -m bot.scheduler              # 4개 cron job(08:50/09:30/12:00/15:20 KST) dry-run 스케줄러 기동
+python -m bot.scheduler --once       # dry-run 사이클 1회 실행 후 종료(터미널 digest 출력)
+python -m bot.scheduler --send-alert # Telegram 전송 opt-in (기본은 전송하지 않음)
+```
+paper portfolio snapshot 은 Redis `kronos:stock:paper:portfolio` 에 저장되어 `/paper/portfolio` 로 조회한다.
+
 ## 구조
 ```
 inference/   predictor.py · kr_data_fetcher.py · forecast_runner.py (구현됨)
+             toss_data_fetcher.py (Toss read-only 시세 provider, 구현됨)
              vendor_kronos.sh (Kronos model/ vendoring 스크립트)
-strategy/    analyzer.py, backtester.py (예정)
-bot/         alert_bot.py, scheduler.py (예정)
-dashboard/   app.py  ← 헬스/상태 대시보드 (구현됨)
+strategy/    analyzer.py · backtester.py · paper_trader.py (구현됨)
+bot/         alert_bot.py · scheduler.py (dry-run runner, 구현됨)
+dashboard/   app.py  ← 헬스/상태 + forecast/signal/paper 조회 (구현됨)
 common/      config.py, redis_client.py  (구현됨)
-tests/       test_forecast_runner.py (구현됨)
+tests/       test_forecast_runner.py · test_toss_data_fetcher.py
+             test_analyzer_paper_trader.py · test_backtester.py
+             test_dashboard_and_alerts.py · test_scheduler_dry_run.py (구현됨)
 notebooks/   backtest.ipynb (예정)
 ```
 
