@@ -5,6 +5,7 @@ forecast 함수와 Redis를 주입/monkeypatch 하며, KIS/Telegram/실주문 AP
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import fakeredis
 import numpy as np
@@ -112,6 +113,17 @@ def test_create_scheduler_registers_four_dry_run_jobs(monkeypatch):
         "kronos-dry-run-close",
     }
     assert all(job.kwargs == {"send_alert": False} for job in jobs)
+
+
+def test_vps_timer_wrapper_sends_alerts_but_stays_paper_only():
+    wrapper = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "kronostock-dry-run-once.sh"
+    script = wrapper.read_text(encoding="utf-8")
+
+    assert "run_dry_run_cycle(send_alert=True, persist_portfolio=True)" in script
+    assert "PaperPortfolio" not in script  # wrapper delegates to scheduler dry-run; no broker adapter wiring here.
+    assert "kis" not in script.lower()
+    assert "broker" not in script.lower()
+    assert "place_order" not in script
 
 
 @pytest.mark.parametrize("value", ["24:00", "12:60", "bad", "9"])
