@@ -24,7 +24,14 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/kronostock_deploy_key
           chmod 600 ~/.ssh/kronostock_deploy_key
-          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          touch ~/.ssh/known_hosts
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -p "$VPS_PORT" -T 10 -H "$VPS_HOST" >> ~/.ssh/known_hosts; then
+              break
+            fi
+            echo "ssh-keyscan failed on attempt $attempt; retrying..." >&2
+            sleep 3
+          done
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy KronosStock
@@ -35,7 +42,7 @@ jobs:
           DEPLOY_REF: ${{ github.sha }}
           APP_DIR: /srv/agent-workspaces/KronosStock
         run: |
-          ssh -i ~/.ssh/kronostock_deploy_key -o IdentitiesOnly=yes -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' APP_DIR='$APP_DIR' bash -s" <<'REMOTE'
+          ssh -i ~/.ssh/kronostock_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' APP_DIR='$APP_DIR' bash -s" <<'REMOTE'
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
 
