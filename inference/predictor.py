@@ -263,6 +263,7 @@ class KronosForecaster:
         top_p: float = 0.9,
         quantiles: tuple[float, float, float] = (0.1, 0.5, 0.9),
         keep_paths: bool = False,
+        band_scale: float = 1.7,
     ) -> ForecastResult:
         """
         n_paths개의 독립 표본 경로를 생성해 분위수 밴드/상승확률을 계산.
@@ -297,6 +298,11 @@ class KronosForecaster:
         median = np.quantile(closes, qm, axis=0)
         upper = np.quantile(closes, qh, axis=0)
         up_prob = float(np.mean(closes[:, -1] > last_close))
+
+        # L1 밴드 캘리브레이션(decoupled): median/up_prob 는 그대로 두고(저T 신호 보존)
+        # 밴드폭만 median 중심으로 band_scale 배 확대 → 커버리지를 목표(≈80%)로 보정.
+        lower = median - band_scale * (median - lower)
+        upper = median + band_scale * (upper - median)
 
         return ForecastResult(
             code=code,
