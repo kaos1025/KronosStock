@@ -69,3 +69,6 @@ Thumbs.db
 
 # ── Tooling (oh-my-claudecode 세션 상태) ──────────────────────────────
 .omc/
+
+# ── Eval / optimization loop runs (재생성 가능 — baseline/candidate 지표) ──
+eval_runs/
