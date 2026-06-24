@@ -5,12 +5,18 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Iterable
 
 from common.config import settings
 from common.symbols import display_symbol
 from strategy.analyzer import SignalAction, TradeSignal
 from strategy.paper_trader import PaperOrder, PaperPortfolio
+
+# httpx 가 요청 URL 을 INFO 로 로깅하면 Telegram sendMessage URL(봇 토큰 포함)이 평문으로
+# journald 등 로그에 남는다(토큰 누출). telegram HTTP 클라이언트(httpx)의 로거를 WARNING 으로
+# 낮춰 누출을 차단한다. 이 모듈을 import 하는 모든 전송 경로(프로덕션 dry-run 포함)에 적용된다.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def format_signal(signal: TradeSignal) -> str:
