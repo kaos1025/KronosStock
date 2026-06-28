@@ -101,6 +101,37 @@ predictor 가 모델명으로 자동 매핑한다(`config.py` 의 `kronos_*` 값
 **한국 장 휴장일:** `exchange_calendars` 의 `XKRX` 캘린더로 미래 타임스탬프에서 휴장일을 제거한다
 (음력·대체공휴일·임시휴장 자동 반영). 미설치/실패 시 평일(월~금) 기준으로 폴백(경고 로깅).
 
+## 예측 품질 평가 + 최적화 루프
+예측이 "맞나"가 아니라 **"베이스라인(랜덤워크)보다 나은가"** 와 **"확률 밴드가 정직한가"** 를
+walk-forward 로 측정한다. 예측 품질을 바꾸는 변경은 반드시 이 루프로만 진행한다("좋아 보인다"로 머지 금지).
+프로토콜 전문은 [`CLAUDE.md`](./CLAUDE.md) 의 "🔁 최적화 루프 프로토콜" 참고.
+
+북극성 지표(`strategy/evaluator.py`):
+- **edge** = 모델 방향 적중률 − 베이스라인(추세지속) — ↑ 좋음, 음수면 동전던지기 이하
+- **skill_score** = 1 − MAE_model / MAE_randomwalk — ↑ 좋음, ≤0 이면 랜덤워크 이하
+- **coverage_gap** = |밴드 커버리지 − 목표(0.80)| — ↓ 좋음, 0 이면 밴드가 정직
+
+```bash
+make loop-baseline CODES="005930 000660" NE=40 NP=50   # 변경 전 baseline 고정 (eval_runs/baseline.json)
+# ... 가설을 1개만 변경(하이퍼파라미터 1개 또는 코드 1곳) ...
+make loop-try CONFIRM=20      # 재측정 + 홀드아웃 확인 + 자동 ACCEPT/REJECT 판정
+make loop-promote             # ACCEPT 일 때만 baseline 갱신
+make loop-show                # 현재 baseline/candidate 지표
+make eval                     # 단발 측정(리포트만, 영속화 X)
+```
+- 루프 1회전 = 커밋 1개(메시지에 Δedge / Δskill / Δcoverage 기록).
+- 금지: n_eval·horizon·codes 를 바꾸며 baseline 과 비교(잣대 불일치 → 무효) / 노이즈(±2%p) 채택 / 동시 다중 변경.
+- `eval_runs/`(baseline·candidate JSON)는 `.gitignore` 처리(재생성 가능, 로컬 전용).
+- ⚠️ CPU 비용: 1 origin = n_paths 회 autoregressive 추론. 2 vCPU 기준 종목당 수~수십 분 → **오프라인 1회성 잡**으로 돌릴 것(`make` 없으면 `.venv` python 으로 `python -m strategy.loop ...` 직접 호출).
+
+### 현재 예측 품질 (정직한 상태)
+일봉 대형주는 랜덤워크에 가깝다(martingale) — **방향 edge ≈ 0(코인플립), 점예측 skill ≤ 0**.
+이건 모델 결함이 아니라 일봉 대형주의 본질이다. 따라서 이 도구의 가치는 *수익 예측*이 아니라
+**거짓 확신 없는 정직한 불확실성 표현**에 둔다:
+- **밴드 캘리브레이션(L1)**: `predict_probabilistic` 의 `band_scale`(밴드폭만 median 중심 ×1.7, median/up_prob 불변)로
+  밴드 커버리지를 55.5%→~80% 로 보정(`coverage_gap` −24.5%p → −0.8%p). 점예측 정확도는 추적만 하고 목표로 삼지 않는다.
+- 강한 추세 레짐에서는 단일 라이브 예측의 밴드가 넓게 나올 수 있다(레짐 대응은 후속 루프 항목).
+
 ## 대시보드 엔드포인트
 `uvicorn dashboard.app:app --reload` 로 띄운다. 모든 응답은 **비밀값/토큰 비노출**.
 | Method · Path | 설명 |
@@ -125,7 +156,7 @@ python -m bot.scheduler --send-alert # Telegram 전송 opt-in
 paper portfolio snapshot 은 Redis `kronos:stock:paper:portfolio` 에 저장되어 `/paper/portfolio` 로 조회한다.
 
 ## VPS 배포 자동화
-`main` 브랜치 push 시 GitHub Actions `.github/workflows/deploy-vps.yml` 이 Hostinger VPS의
+`main` 브랜치 push 시 GitHub Actions `.github/workflows/deploy-vps.yml` 이 Hetzner VPS(CX22)의
 `/srv/agent-workspaces/KronosStock` 를 해당 커밋으로 `reset --hard` 하고 테스트/서비스 갱신을 수행한다.
 서버 로컬 파일 `.env`, `.venv/`, `model/` 은 보존한다.
 
@@ -150,6 +181,7 @@ inference/   predictor.py · kr_data_fetcher.py · forecast_runner.py (구현됨
              toss_data_fetcher.py (Toss read-only 시세 provider, 구현됨)
              vendor_kronos.sh (Kronos model/ vendoring 스크립트)
 strategy/    analyzer.py · backtester.py · paper_trader.py (구현됨)
+             evaluator.py · loop.py (walk-forward 평가 + 최적화 루프, 구현됨)
 bot/         alert_bot.py · scheduler.py (dry-run runner, 구현됨)
 dashboard/   app.py  ← 헬스/상태 + forecast/signal/paper 조회 (구현됨)
 common/      config.py, redis_client.py  (구현됨)
@@ -157,6 +189,8 @@ tests/       test_forecast_runner.py · test_toss_data_fetcher.py
              test_analyzer_paper_trader.py · test_backtester.py
              test_dashboard_and_alerts.py · test_scheduler_dry_run.py (구현됨)
 notebooks/   backtest.ipynb (예정)
+Makefile     loop-baseline / loop-try / loop-promote / loop-show / eval 타깃
+eval_runs/   baseline·candidate 지표 JSON (gitignore, 로컬 전용)
 ```
 
 ## 의존성 메모
@@ -169,4 +203,5 @@ notebooks/   backtest.ipynb (예정)
 
 ## 보안
 - `.env`는 절대 커밋 금지(`.gitignore`로 차단). 비밀값은 환경변수로만 주입.
+- **로그에 비밀값 금지**: `httpx` 가 요청 URL 을 INFO 로 찍으면 Telegram `sendMessage` URL(봇 토큰 포함)이 평문으로 로그(journald)에 남는다. `bot/alert_bot.py` 가 `httpx` 로거를 WARNING 으로 낮춰 차단한다 — **텔레그램/httpx 경로에 INFO 로깅 재도입 금지.**
 - 자동매매는 충분한 **모의투자 검증 후** 실전 전환(Phase 2+).
