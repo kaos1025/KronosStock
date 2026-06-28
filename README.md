@@ -156,7 +156,7 @@ python -m bot.scheduler --send-alert # Telegram 전송 opt-in
 paper portfolio snapshot 은 Redis `kronos:stock:paper:portfolio` 에 저장되어 `/paper/portfolio` 로 조회한다.
 
 ## VPS 배포 자동화
-`main` 브랜치 push 시 GitHub Actions `.github/workflows/deploy-vps.yml` 이 Hetzner VPS(CX22)의
+`main` 브랜치 push 시 GitHub Actions `.github/workflows/deploy-vps.yml` 이 Hostinger VPS의
 `/srv/agent-workspaces/KronosStock` 를 해당 커밋으로 `reset --hard` 하고 테스트/서비스 갱신을 수행한다.
 서버 로컬 파일 `.env`, `.venv/`, `model/` 은 보존한다.
 

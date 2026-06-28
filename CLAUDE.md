@@ -16,7 +16,7 @@
 - 모델: Kronos-mini (PyTorch, KronosKit의 predictor.py 래퍼 재사용)
 - 버퍼: Redis (KronosKit과 동일 인스턴스 공유 가능)
 - 알림: Telegram 개인 DM (python-telegram-bot)
-- 배포: KronosKit과 동일 Hetzner CX22에 Docker Compose 서비스로 추가
+- 배포: KronosKit과 동일 Hostinger VPS에 Docker Compose 서비스로 추가
 - 스케줄러: APScheduler (장 시작 전 09:00, 장중 주요 시점에 예측)
 
 ## 한국투자증권 Open API 참고사항
