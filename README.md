@@ -201,6 +201,97 @@ eval_runs/   baseline·candidate 지표 JSON (gitignore, 로컬 전용)
 - 테스트 전용 의존성은 `requirements-dev.txt`(pytest, fakeredis) — 런타임 이미지 미포함.
 - 로컬이 Python 3.13이면 핀이 어긋날 수 있다 — 권위 있는 검증은 `docker build`(3.11).
 
+## KSF 대시보드 프라이빗 브라우저 미리보기 (SSH 터널)
+대시보드 서비스(`deploy/systemd/kronostock-dashboard.service`)는 VPS 루프백
+`127.0.0.1:8000` 에만 바인딩된다 — 공개 바인딩/`--reload` 없음. 클라이언트에서 SSH 터널로 접속:
+
+```bash
+ssh -N -L 8000:127.0.0.1:8000 deploy@<VPS_HOST>
+```
+
+대시보드 자격증명은 레포 전체 `.env` 가 아니라 **대시보드 전용 최소권한 env 파일**
+`/srv/kronostock/config/ksf-dashboard.env`(모드 0600, 소유자 `deploy`)에서만 읽는다.
+이 파일에는 읽기 자격증명 3개만 넣는다 — 다른 비밀(KIS/텔레그램)은 절대 넣지 않는다.
+개념적 생성 예시(플레이스홀더만, 실제 값은 커밋/기록 금지):
+
+```bash
+# VPS 에서 1회 (root 또는 sudo):
+install -d -m 0755 /srv/kronostock/config
+umask 077
+cat > /srv/kronostock/config/ksf-dashboard.env <<'ENV'
+KSF_READ_USERNAME=<원하는_사용자명>
+KSF_READ_PASSWORD=<강한_임의_비밀번호>
+KSF_READ_TOKEN=<강한_임의_토큰>
+ENV
+chown deploy:deploy /srv/kronostock/config/ksf-dashboard.env
+chmod 0600 /srv/kronostock/config/ksf-dashboard.env
+```
+
+브라우저에서 열면 HTTP Basic 로그인 창이 뜬다(`KSF_READ_USERNAME` / `KSF_READ_PASSWORD`,
+둘 다 비어 있지 않게 설정돼야 하며 미설정/부분설정이면 Basic 은 전면 거부):
+- http://127.0.0.1:8000/ksf — 카드 목록
+- http://127.0.0.1:8000/ksf/005930 — 삼성전자 상세
+- http://127.0.0.1:8000/ksf/000660 — SK하이닉스 상세
+
+HTTP 트래픽은 VPS 루프백을 벗어나지 않고, 클라이언트↔VPS 구간은 SSH 로 암호화된다.
+JSON/API 클라이언트는 기존 `Authorization: Bearer <token>` 헤더(`KSF_READ_TOKEN` 값)가 그대로 유효하다.
+쿼리스트링 자격증명은 받지 않는다(항상 401). 유닛은 uvicorn 을 `--no-access-log` 로 실행하므로
+요청 라인(URL 쿼리스트링 포함)이 액세스 로그로 journald 에 기록되지 않는다 — 테스트로 검증된
+범위는 여기까지이며, 애플리케이션 에러 로그 전반의 자격증명 마스킹을 보장하는 것은 아니다.
+DB 경로(`KSF_LEDGER_DB_PATH`)는 비밀이 아니므로 유닛의 `Environment=` 지시어로 주입한다.
+
+### 원장 스냅샷 (WAL + 완전 읽기 전용 서비스의 공존)
+프로덕션 원장 `/srv/kronostock/data/ksf_ledger.sqlite3` 은 **의도적으로 WAL 저널
+모드**다(수집기 동시성). WAL DB 자체는 읽기 전용으로 읽을 수 있지만 — 읽을 수 있는
+`-wal`/`-shm` 사이드카가 있을 때 한정이다. 마지막 writer 가 최종 체크포인트 후
+사이드카를 지운 상태에서는, 완전 읽기 전용 트리에서 `mode=ro` 열기가
+`attempt to write a readonly database` 로 실패한다(SQLite 가 사이드카를 재생성하려
+하기 때문). 그래서 대시보드 유닛은 시작 시점에 스냅샷을 뜬다:
+
+1. `ExecStartPre` 가 `scripts/deploy/prepare_ksf_dashboard_snapshot.py` 를 실행해
+   원장을 SQLite backup API 로 `/run/kronostock-dashboard/ksf-ledger.sqlite3`
+   (RuntimeDirectory, 0700)에 원자적으로 복사한다 — 임시 파일에 백업 →
+   `integrity_check` → DELETE 저널로 변환 → `os.replace`.
+2. 원본은 `mode=ro` + `query_only` 로만 연다. 사이드카가 **둘 다 없을 때만**
+   `immutable=1` 로 폴백한다. **주의(과거 문서의 정정)**: 사이드카 부재 관찰만으로는
+   안전이 보장되지 않는다 — 관찰 직후 writer 가 시작해 커밋하면 immutable 백업이
+   그 커밋을 조용히 무시할 수 있다(TOCTOU). 폴백이 안전한 것은 아래의 **writer-배제
+   잠금을 관찰~백업~발행 전 구간 동안 쥐고 있기 때문**이다. 사이드카가 하나만
+   있거나 열기 실패 시에는 스냅샷을 거부하고 서비스 시작을 막는다
+   (fail-closed — 커밋된 WAL 프레임 무시 금지).
+3. 대시보드(`KSF_LEDGER_DB_PATH`)는 런타임 스냅샷만 읽는다. 프로덕션 데이터
+   디렉터리는 서비스에 읽기 전용(`ReadOnlyPaths`)이고, 쓰기 가능한 경로는
+   `/run/kronostock-dashboard` 하나뿐이다.
+
+즉 대시보드가 보여주는 데이터는 **서비스 시작 시점의 point-in-time 스냅샷**이다.
+수집기가 원장을 갱신한 뒤 대시보드에 반영하려면 `systemctl restart
+kronostock-dashboard` 로 재시작해야 한다.
+
+### 원장 사이드카 잠금 (writer-배제, `ksf/ledger_lock.py`)
+원장의 모든 접근은 DB 경로에서 유도되는 단일 잠금 파일
+`/srv/kronostock/data/ksf_ledger.sqlite3.lock` (= `Path(f"{db}.lock")`) 위의
+배타 `flock` 으로 직렬화된다. 잠금 경로는 호출자가 지정할 수 없어, runner 를
+직접 실행해도 다른 잠금을 몰래 쓸 수 없다.
+
+- **writer (`ksf.production_runner.run_once`)**: DB 를 열거나 만들기 **이전에**
+  잠금을 배타 획득하고, 마이그레이션·수집·커밋·연결 close 까지 run 전체 동안
+  유지한다. 잠금 파일이 없으면 안전하게 생성한다(0600, O_NOFOLLOW, 정규 파일·
+  소유자·권한 검증). timer wrapper 의 외부 `flock` 은 제거되었다 — 모든
+  프로덕션 writer 는 내부에서 잠금을 잡으므로 외부 잠금을 다시 씌우면 이중
+  잠금/자기교착 위험만 생긴다.
+- **스냅샷 헬퍼**: 이미 존재하는 잠금만 O_CREAT 없이 읽기 전용으로 열어
+  (읽기 전용 fd 위의 배타 flock — Linux 에서 유효) 사이드카 관찰 → mode=ro
+  백업 → immutable 폴백 → 무결성/저널 변환 → 발행까지 전 구간 동안 쥔다.
+- **대기/fail-closed**: 두 모드 모두 monotonic 논블로킹 flock 루프로 최대
+  60초 대기한다. 잠금 파일이 없거나(스냅샷 모드), 심볼릭 링크/비정규 파일,
+  다른 소유자, group/world 권한, 대기 초과 — 전부 즉시 실패한다. runner CLI 는
+  `{"status":"failed","failed_stage":"lock"}` 만 출력한다(경로/비밀 비노출).
+- **배포 선행조건**: 대시보드 서비스 시작 전에 잠금 파일이 존재해야 한다
+  (`install -o deploy -g deploy -m 0600 /dev/null /srv/kronostock/data/ksf_ledger.sqlite3.lock`,
+  또는 첫 writer 실행이 생성한 것을 사용). 잠금 파일이 없거나 unsafe
+  (심볼릭 링크·비정규 파일·타 소유자·group/world 권한)면 `ExecStartPre` 가
+  실패해 서비스가 시작되지 않는다.
+
 ## 보안
 - `.env`는 절대 커밋 금지(`.gitignore`로 차단). 비밀값은 환경변수로만 주입.
 - **로그에 비밀값 금지**: `httpx` 가 요청 URL 을 INFO 로 찍으면 Telegram `sendMessage` URL(봇 토큰 포함)이 평문으로 로그(journald)에 남는다. `bot/alert_bot.py` 가 `httpx` 로거를 WARNING 으로 낮춰 차단한다 — **텔레그램/httpx 경로에 INFO 로깅 재도입 금지.**

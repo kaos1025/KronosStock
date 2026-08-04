@@ -73,17 +73,34 @@ def _feature_value(rows: dict[str, sqlite3.Row], aliases: tuple[str, ...]) -> di
     row = next((rows[name] for name in aliases if name in rows), None)
     if row is None:
         return {"value": None, "status": "MISSING"}
+    status = row["feature_status"]
+    if status == "LICENSE_BLOCKED":
+        # 라이선스 차단 항목은 value_json 을 파싱하지 않는다 — 값/메타데이터 전부 비노출.
+        return {"value": None, "status": status, "source_as_of": row["source_as_of"]}
+    payload: Any = None
+    if row["value_json"]:
+        try:
+            payload = json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            # 깨진 metadata 는 정책을 싣지 못한다 — 아래 스칼라 컬럼 값은 그대로 유효.
+            payload = None
+    if isinstance(payload, dict):
+        # display_policy 는 value_num/value_text 존재 여부와 무관하게 항상 먼저 평가한다.
+        if payload.get("display_policy") == "do_not_display_or_score":
+            return {"value": None, "status": status, "source_as_of": row["source_as_of"]}
+        # dict payload 는 metadata 컨테이너 — URL/정책 문자열이 실릴 수 있으므로
+        # 원본 dict 를 그대로 노출하지 않고 "value" 키만 꺼낸다.
+        payload = payload.get("value")
+    if not isinstance(payload, (int, float, str)):
+        payload = None  # 스칼라만 노출 — 컨테이너형 payload 는 metadata 로 간주
     value: Any = row["value_num"]
     if value is None:
         value = row["value_text"]
-    if value is None and row["value_json"]:
-        try:
-            value = json.loads(row["value_json"])
-        except json.JSONDecodeError:
-            value = None
+    if value is None:
+        value = payload
     return {
         "value": value,
-        "status": row["feature_status"],
+        "status": status,
         "source_as_of": row["source_as_of"],
     }
 

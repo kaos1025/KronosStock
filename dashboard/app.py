@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import html
 import os
@@ -77,22 +79,58 @@ def paper_portfolio() -> dict:
     return json.loads(raw)
 
 
-def _require_ksf_auth(authorization: str | None = Header(default=None)) -> None:
+def _bearer_valid(supplied: str) -> bool:
     expected = os.environ.get("KSF_READ_TOKEN", "")
-    prefix = "Bearer "
-    supplied = authorization[len(prefix):] if authorization and authorization.startswith(prefix) else ""
     try:
-        valid = bool(expected and supplied) and secrets.compare_digest(
+        return bool(expected and supplied) and secrets.compare_digest(
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
     except UnicodeError:
-        valid = False
-    if not valid:
-        raise HTTPException(
-            status_code=401,
-            detail="authentication required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        return False
+
+
+def _basic_valid(payload: str) -> bool:
+    expected_user = os.environ.get("KSF_READ_USERNAME", "")
+    expected_password = os.environ.get("KSF_READ_PASSWORD", "")
+    if not (expected_user and expected_password):
+        return False  # 부분/미설정 구성이면 무조건 거부 (fail-closed)
+    try:
+        decoded = base64.b64decode(payload.encode("ascii"), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeError, ValueError):
+        return False
+    username, sep, password = decoded.partition(":")
+    if not sep:
+        return False
+    try:
+        # env 값에 서러게이트 등 인코딩 불가 문자가 있으면 500 대신 거부 (fail-closed)
+        expected_user_bytes = expected_user.encode("utf-8")
+        expected_password_bytes = expected_password.encode("utf-8")
+    except UnicodeError:
+        return False
+    # 비단락 & 로 두 비교를 항상 수행 (타이밍 차이 최소화)
+    return secrets.compare_digest(
+        username.encode("utf-8"), expected_user_bytes
+    ) & secrets.compare_digest(
+        password.encode("utf-8"), expected_password_bytes
+    )
+
+
+def _require_ksf_auth(authorization: str | None = Header(default=None)) -> None:
+    # RFC 9110: 스킴은 대소문자 무시. 스킴만 정규화하고 자격증명 파싱은 엄격 유지.
+    scheme, _, credential = (authorization or "").partition(" ")
+    scheme = scheme.lower()
+    if scheme == "bearer" and _bearer_valid(credential):
+        return
+    if scheme == "basic" and _basic_valid(credential):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="authentication required",
+        headers={
+            "WWW-Authenticate": 'Basic realm="KronosStock KSF", charset="UTF-8", '
+            'Bearer realm="KronosStock KSF"'
+        },
+    )
 
 
 @app.get("/ksf/cards")

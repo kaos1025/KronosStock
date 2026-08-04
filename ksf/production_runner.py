@@ -26,6 +26,7 @@ from inference.k_semiconductor_domestic_price_collector import (
 )
 from ksf.feature_engine import FeatureEngine
 from ksf.global_collector import collect_global_inputs, stable_json
+from ksf.ledger_lock import DEFAULT_TIMEOUT_SECONDS, LedgerLockError, acquire_writer_lock
 
 
 KST = timezone(timedelta(hours=9))
@@ -94,6 +95,8 @@ class RunnerDependencies:
     migration_paths: tuple[Path, ...] = MIGRATIONS
     # 전역 trading_date 는 KST 달력 날짜가 아니라 최신 '완료' XKRX 세션이어야 한다(fail-closed).
     trading_session: Callable[[datetime], date] = latest_completed_xkrx_session
+    # 사이드카 잠금(<db>.lock) 대기 상한 — 초과 시 StageFailure("lock") fail-closed.
+    lock_timeout: float = DEFAULT_TIMEOUT_SECONDS
 
 
 def _kst_timestamp(value: datetime) -> str:
@@ -164,6 +167,22 @@ def _global_counts(results: dict[str, Any]) -> dict[str, Any]:
 def run_once(db_path: str | Path, *, dependencies: RunnerDependencies | None = None) -> dict[str, Any]:
     deps = dependencies or RunnerDependencies()
     path = Path(db_path)
+    # DB 를 열거나 만들기 전에 사이드카 잠금부터 배타 획득한다. 잠금은 run 전체와
+    # 연결 close 이후까지 유지되어, 스냅샷의 관찰~immutable 백업 구간과 상호 배제된다.
+    # 잠금 파일 생성에 필요한 부모 디렉터리만 먼저 보장한다(권한 강화는 잠금 획득 후
+    # _open_and_migrate 가 수행한다).
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = acquire_writer_lock(path, timeout=deps.lock_timeout)
+    except (LedgerLockError, OSError) as exc:
+        raise StageFailure("lock") from exc
+    try:
+        return _run_once_locked(path, deps)
+    finally:
+        lock.release()
+
+
+def _run_once_locked(path: Path, deps: RunnerDependencies) -> dict[str, Any]:
     try:
         conn = _open_and_migrate(path, deps.migration_paths)
     except Exception as exc:

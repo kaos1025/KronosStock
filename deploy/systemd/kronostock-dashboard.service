@@ -1,0 +1,55 @@
+[Unit]
+Description=KronosStock KSF read-only dashboard (loopback only, access via SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/srv/agent-workspaces/KronosStock
+# 대시보드 전용 최소권한 env 파일(0600) — KSF_READ_USERNAME / KSF_READ_PASSWORD / KSF_READ_TOKEN 만 포함.
+# 레포 전체 .env(KIS/텔레그램 비밀 포함)는 이 프로세스에 주입하지 않는다.
+EnvironmentFile=/srv/kronostock/config/ksf-dashboard.env
+# 프로덕션 원장은 WAL 모드(의도적)라 사이드카가 없으면 읽기 전용 트리에서 열리지
+# 않는다. 시작 시점에 런타임 디렉터리로 point-in-time 스냅샷(DELETE 저널)을 만들고
+# 대시보드는 그 스냅샷만 읽는다. 데이터 갱신은 서비스 재시작 시 반영된다.
+#
+# 배포 선행조건 (Codex closure B — writer-배제 잠금):
+# 스냅샷 헬퍼는 원장 사이드카 잠금 /srv/kronostock/data/ksf_ledger.sqlite3.lock 을
+# source 인자에서 자동 유도해 O_CREAT 없이 읽기 전용으로 열고, 사이드카 관찰~백업
+# ~발행 전 구간 동안 배타 잠금(읽기 전용 fd 위 flock)을 쥔다. 프로덕션 writer
+# (ksf.production_runner)도 같은 잠금을 내부에서 쥔다. 잠금 파일은 대시보드 시작
+# **이전에** 반드시 존재해야 한다 — 없으면 ExecStartPre 가 fail-closed 로 실패해
+# 서비스가 시작되지 않는다. 생성(1회, deploy 소유 0600):
+#   sudo install -o deploy -g deploy -m 0600 /dev/null /srv/kronostock/data/ksf_ledger.sqlite3.lock
+# (첫 writer 실행이 만든 잠금을 그대로 써도 된다. 잠금은 fd 로만 사용하므로
+#  ReadOnlyPaths 아래에서도 동작하며, 쓰기 경로 grant 를 추가하지 않는다.)
+Environment=KSF_LEDGER_DB_PATH=/run/kronostock-dashboard/ksf-ledger.sqlite3
+RuntimeDirectory=kronostock-dashboard
+RuntimeDirectoryMode=0700
+ExecStartPre=/srv/agent-workspaces/KronosStock/.venv/bin/python /srv/agent-workspaces/KronosStock/scripts/deploy/prepare_ksf_dashboard_snapshot.py /srv/kronostock/data/ksf_ledger.sqlite3 /run/kronostock-dashboard/ksf-ledger.sqlite3
+# --no-access-log: 액세스 로그가 쿼리스트링(거부된 자격증명 시도 포함)을 journald 에 남기지 않도록 차단.
+ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m uvicorn dashboard.app:app --host 127.0.0.1 --port 8000 --no-access-log
+Restart=on-failure
+RestartSec=5
+Nice=5
+
+# 하드닝: 파일시스템 전체 읽기 전용(ProtectSystem=strict). 유일한 쓰기 경로는
+# RuntimeDirectory 인 /run/kronostock-dashboard (스냅샷 저장용) 뿐이며,
+# 프로덕션 데이터 디렉터리는 명시적으로 읽기 전용을 유지한다.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/srv/kronostock/data
+ReadWritePaths=/run/kronostock-dashboard
+UMask=0077
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
