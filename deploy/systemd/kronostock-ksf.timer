@@ -1,0 +1,10 @@
+[Unit]
+Description=Run KronosStock K-Semiconductor Flow Desk after KRX close
+
+[Timer]
+OnCalendar=Mon..Fri 16:10:00 Asia/Seoul
+Persistent=false
+Unit=kronostock-ksf.service
+
+[Install]
+WantedBy=timers.target

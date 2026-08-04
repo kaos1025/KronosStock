@@ -1,6 +1,6 @@
 # KIS/KRX 국내 투자자 수급 API 실응답 검증
 
-기준 시각: 2026-07-31 21:59 KST
+실시간 검증일: 2026-08-01 KST; 반환 데이터 최신 거래일: 2026-07-31
 대상 종목: 삼성전자(005930), SK하이닉스(000660)
 안전 범위: read-only 시세/통계 조회만 검토. KIS 주문/계좌/실주문 API는 호출하지 않음.
 상위 계약: `docs/k-semiconductor-mvp-operating-scope.md`의 Gate B, canonical status/timestamp, 영구 원장 및 no-look-ahead 규칙을 따른다.
@@ -9,48 +9,17 @@
 
 1. 장중 외국인·기관 방향성은 KIS `종목별 외인기관 추정가집계` 또는 `국내기관_외국인 매매종목가집계`로 받을 수 있다. 단, 공식 확정 데이터가 아니라 증권사 직원 입력/단순 누계 기반 가집계다.
 2. 장마감 후 확정/공식성은 KRX `투자자별 거래실적(개별종목)`이 우선 fallback이다. 이 화면은 기관 세부 주체(금융투자/보험/투신/사모/은행/기타금융/연기금 등)까지 분해된다.
-3. 이 VPS의 `.env`에는 KIS 실전/모의 AppKey/AppSecret/HTS/계좌 값이 비어 있어 KIS 실호출은 토큰 발급 단계까지 가지 못했다. 따라서 이번 산출물의 KIS 응답 필드는 공식 `koreainvestment/open-trading-api` 샘플 코드와 체크 스크립트 기준으로 검증했다.
+3. KIS 자격증명 구성과 OAuth 발급, 삼성전자·SK하이닉스의 두 시세 GET 실응답을 확인했다. KIS 외국인·기관 및 `기금` 데이터는 브로커 출처 데이터로 사용할 수 있다. 다만 KIS `기금`을 KRX `연기금 등` 또는 국민연금과 동일하다고 간주하지 않으며, KIS 값을 공식 종가 확정 데이터로 표시하지 않는다.
 4. KRX 웹 JSON 직접 호출은 현재 세션/권한 요구로 `400 LOGOUT`을 반환했다. 브라우저 화면/공식 페이지 스키마와 pykrx wrapper의 KRX bld/필드 매핑은 확인했지만, 이 환경에서 실데이터 rows는 확보하지 못했다.
 5. MVP 기본 정책은 `KIS 장중 가집계 → KRX 장마감 확정 → 수동 CSV/증권사 HTS export` 순서가 안전하다. 자동 매매/주문 판단에는 장중 가집계만 단독 사용하지 않는다.
 
 ## 검증 환경에서 실제 확인한 실행 결과
 
-### KIS 자격증명 상태
+### KIS 자격증명·인증 상태
 
-명령:
+민감값을 출력하지 않는 점검에서 `KIS_HTS_ID`, `KIS_APPKEY`, `KIS_APPSECRET`, `KIS_ACCOUNT`가 모두 존재했다. `settings.kis_configured=True`, `KIS_USE_VIRTUAL=True`, `.env` 파일 mode `600`도 확인했다. 값이나 해시는 기록하지 않았다.
 
-```bash
-python3 - <<'PY'
-from pathlib import Path
-for line in Path('.env').read_text(errors='ignore').splitlines():
-    s=line.strip()
-    if not s or s.startswith('#') or '=' not in s: continue
-    k,v=s.split('=',1)
-    k=k.replace('export ','').strip()
-    if k.startswith('KIS'):
-        val=v.strip().strip('"').strip("'")
-        print(k, 'SET' if val else 'EMPTY_OR_PLACEHOLDER', 'len', len(val))
-PY
-```
-
-실제 출력 요약:
-
-```text
-KIS_HTS_ID EMPTY_OR_PLACEHOLDER len 0
-KIS_APPKEY EMPTY_OR_PLACEHOLDER len 0
-KIS_APPSECRET EMPTY_OR_PLACEHOLDER len 0
-KIS_ACCOUNT EMPTY_OR_PLACEHOLDER len 0
-KIS_VIRTUAL_APPKEY EMPTY_OR_PLACEHOLDER len 0
-KIS_VIRTUAL_APPSECRET EMPTY_OR_PLACEHOLDER len 0
-KIS_VIRTUAL_ACCOUNT EMPTY_OR_PLACEHOLDER len 0
-KIS_VIRTUAL_HTS_ID EMPTY_OR_PLACEHOLDER len 0
-KIS_USE_VIRTUAL SET len 4
-KIS_KEEP_TOKEN SET len 4
-KIS_TOKEN_DIR SET len 6
-KIS_USE_WEBSOCKET SET len 5
-```
-
-직접 KIS 토큰 스모크도 `credentials_present False False`로 중단됐다. 토큰 또는 secret 값은 출력/저장하지 않았다.
+`POST https://openapi.koreainvestment.com:9443/oauth2/tokenP`는 HTTP 200, `token_type=Bearer`, `expires_in=86400`을 반환했다. 토큰·키·raw payload는 로그에 남기거나 별도 저장하지 않았다. 이로써 기존 KIS credential/live-response blocker는 해소됐다.
 
 ### KRX 직접 JSON 호출 상태
 
@@ -75,6 +44,32 @@ askBid=1
 ```
 
 판정: KRX data.krx.co.kr의 웹 JSON endpoint는 이 환경에서 세션/인증 또는 봇 방어를 요구한다. 운영 파이프라인에는 KRX 공식 Open API 인증키 또는 허용된 다운로드/API 경로를 확보해야 한다.
+
+### KIS 실응답 증적
+
+두 API 모두 read-only 시세 GET으로 검증했다. 주문·잔고·보유종목·계좌 endpoint는 호출하지 않았다.
+
+`inquire-investor`(`FHKST01010900`, `FID_COND_MRKT_DIV_CODE=J`) 결과:
+
+| 종목 | 상태/건수 | 날짜 범위 | 20260731 종가 | 개인 순매수 수량/대금 | 외국인 순매수 수량/대금 | 기관 순매수 수량/대금 |
+|---|---|---|---:|---:|---:|---:|
+| 005930 | HTTP 200, `rt_cd=0`, `msg_cd=MCA00000`, 30행 | 20260731~20260619 | 262500 | -11681307 / -2958633 | 8359011 / 2099936 | 3618959 / 935049 |
+| 000660 | HTTP 200, `rt_cd=0`, `msg_cd=MCA00000`, 30행 | 20260731~20260619 | 1718000 | -2463959 / -4122568 | 2205767 / 3648525 | 277183 / 504452 |
+
+두 응답 모두 `tr_cont`는 비어 있었고 rate-limit 관련 응답 header는 없었다.
+
+`investor-trade-by-stock-daily`(`FHPTJ04160001`, market `J`) 결과:
+
+| 기준일/종목 | 상태/건수 | 날짜 범위 | 최신일 선택 세부 수량 |
+|---|---|---|---|
+| 20260731 / 005930 | HTTP 200, `rt_cd=0`, `output1=7`, `output2=30` | 20260731~20260619 | 투자신탁 1695857, 은행 48611, 보험 -166369, 기금 296441; 기금 순매수 대금 70860 |
+| 20260731 / 000660 | HTTP 200, `rt_cd=0`, `output1=7`, `output2=30` | 20260731~20260619 | 투자신탁 382081, 은행 476, 보험 3216, 기금 66317 |
+| 20260618 / 005930 | HTTP 200, `rt_cd=0`, `output1=7`, `output2=30` | 20260618~20260506 | 이전 페이지 탐색 확인 |
+| 20260618 / 000660 | HTTP 200, `rt_cd=0`, `output1=7`, `output2=30` | 20260618~20260506 | 이전 페이지 탐색 확인 |
+
+정상 응답의 `tr_cont`는 모두 비어 있었다. 20260731 조회에서 가장 오래된 행인 20260619의 하루 전을 다음 `FID_INPUT_DATE_1=20260618`로 이동해 이전 30행을 얻었으므로, 관측된 이력 탐색 방식은 날짜 cursor 기반이다. 최대 과거 경계는 끝까지 시험하지 않았으므로 주장하지 않는다. 빠른 무간격 요청 중 한 건의 HTTP 500은 아래 호출 제한 절에 별도 기록한다.
+
+KIS raw `fund_*`의 표시는 `기금`이다. 출처와 category mapping을 유지하며 KRX `연기금 등` 또는 국민연금과 동일한 범주라고 단정하지 않는다.
 
 ## KIS 후보 API 검증
 
@@ -233,10 +228,18 @@ MVP 적합성:
   - `FID_ETC_CLS_CODE`: 공란
 - 응답: `output1`, `output2` 두 DataFrame. 공식 샘플은 pagination/continuation(`tr_cont`) 처리 포함.
 
+실응답 관찰:
+
+- 두 종목의 `FID_INPUT_DATE_1=20260731` 정상 응답은 HTTP 200, `rt_cd=0`, `output1=7`, `output2=30`, 빈 `tr_cont`였고 날짜 범위는 20260731~20260619였다.
+- 두 종목 모두 다음 기준일을 20260618로 옮기면 HTTP 200, `output1=7`, `output2=30`, 날짜 범위 20260618~20260506을 반환했다.
+- 따라서 현재 관찰된 traversal은 이전 응답의 가장 오래된 영업일 하루 전을 `FID_INPUT_DATE_1`로 넘기는 날짜 cursor 방식이다. 빈 `tr_cont`를 종료 또는 전체 이력 완료 신호로 해석하지 않는다.
+- 최대 과거 조회 경계는 비소진(non-exhaustive) 검증 상태다.
+
 MVP 적합성:
 
-- 과거 일별 범위/페이지네이션 검증 후보.
-- 이번 환경에서는 KIS credential 부재로 실제 rows와 최대 과거범위는 확인하지 못했다.
+- 외국인·기관 및 투자신탁/은행/보험/기금 등 KIS 분류의 과거 일별 브로커 데이터를 조회할 수 있다.
+- KIS `기금`은 provenance와 raw category를 보존하며, KRX `연기금 등`의 확정 대체값으로 쓰지 않는다.
+- 실제 rows와 날짜 cursor 이동은 확인했지만 최대 과거범위는 확인하지 않았다.
 
 ## KRX 후보 API 검증
 
@@ -357,8 +360,10 @@ KRX/pykrx wrapper에서 확인한 출력 컬럼:
 
 ## 호출 제한·라이선스 메모
 
-- KIS Open API는 KIS Developers 서비스 신청 및 AppKey/AppSecret 필요. 토큰은 24시간 유효이며 토큰 발급 자체도 제한이 있으므로 토큰 캐시가 필요하다.
-- KIS 포털 공지에 신규 고객 초당 호출 제한 안내가 존재한다. 운영 전 계정별 제한을 포털에서 확인해야 한다.
+- KIS Open API는 KIS Developers 서비스 신청 및 AppKey/AppSecret 필요. 이번 OAuth 응답의 `expires_in`은 86400이었다. 토큰을 재사용/cache하고 즉시 재발급 loop를 만들지 않는다.
+- 무간격 market-data GET 연속 요청에서는 세 번째 요청이 HTTP 500, `rt_cd=1`, `msg_cd=EGW00201`, `초당 거래건수를 초과하였습니다.`로 실패했고 바로 다음 요청은 성공했다.
+- OAuth 발급 후 1.2초 간격 재시험에서는 일별 GET 3/3건이 성공했다. `>=1.2초`를 보수적 pacing 기준으로 적용하고 `EGW00201`에는 횟수가 제한된 backoff retry를 사용한다.
+- 이는 이번 계정·시점에서 관찰한 안전 기준이지 계정 전체의 보장된 한도가 아니다. rate-limit/remain 응답 header도 없었으므로 운영 전 계정별 제한을 별도 확인한다.
 - KIS 샘플 코드는 참고용이며, 샘플 활용으로 인한 손해를 한국투자증권이 책임지지 않는다는 고지 포함.
 - KRX data.krx.co.kr 웹 JSON은 이번 환경에서 `LOGOUT`을 반환했다. 비공식 scraping에 의존하지 말고 KRX Open API 인증키 또는 허용된 다운로드/CSV 절차를 fallback으로 둔다.
 - 외부 데이터는 투자 판단 보조용이며, 장중 가집계와 장마감 확정 데이터는 원장/상태를 분리 저장한다.
@@ -366,14 +371,18 @@ KRX/pykrx wrapper에서 확인한 출력 컬럼:
 ## 운영 fallback 순서
 
 1. 장중: KIS `investor-trend-estimate`로 09:30/11:20/13:20/14:30 슬롯 기준 추정 수량 저장.
-2. 장중 랭킹/교차확인: KIS `foreign-institution-total`에서 대상 종목이 포함되는 경우 수량/금액 및 기관 세부 추정 필드 저장.
-3. 장마감: KRX `MDCSTAT02303` 상세 일별추이로 외국인·기관합계·연기금 확정값 적재.
+2. 브로커 데이터: KIS `inquire-investor`와 `investor-trade-by-stock-daily`로 외국인·기관 및 KIS `기금` 일별 값을 저장하고, `foreign-institution-total`에서 대상 종목이 포함되는 경우 장중 수량/금액을 교차확인한다. KIS 값은 공식 종가 확정값으로 승격하지 않는다.
+3. 장마감 공식 확인: KRX `MDCSTAT02303` 상세 일별추이로 외국인·기관합계와 정확한 `연기금 등` taxonomy의 확정값을 적재.
 4. KRX 자동 실패: KRX Open API 인증키 재시도 또는 수동 CSV export를 `FALLBACK_MANUAL_CSV`로 적재.
 5. 리포트: 같은 날짜에 `CLOSE_CONFIRMED`가 있으면 장중 추정치를 대체하지 말고 별도 섹션에서 추정 대비 확정 차이로 표시.
 
 ## 남은 블로커
 
-- KIS 실 AppKey/AppSecret/HTS ID가 필요하다. 현재 `.env`는 키 이름만 있고 값이 비어 있다. 이는 상위 문서 Gate B의 credential/live-response 검증 blocker이며 확보 전 해당 source는 `BLOCKED_REVIEW`, run은 상황에 따라 `PARTIAL_DATA` 또는 `MISSING_REQUIRED_DATA`다.
 - KRX 공식 Open API 인증키 또는 data.krx.co.kr 세션/다운로드 허용 경로가 필요하다.
-- 위 두 자격이 확보되면 삼성전자/SK하이닉스에 대해 실제 rows, pagination 범위, 계정별 rate limit을 다시 측정해야 한다.
-- 실제 rows가 확보되면 `source_as_of <= available_data_cutoff` 및 `ingested_at_kst <= available_data_cutoff`를 강제하고, cutoff 이후 확정·정정 수급이 과거 run에 섞이지 않는 no-look-ahead test를 Gate B 증적에 포함한다.
+- KRX 실응답 전에는 공식 장마감 확인과 KRX의 정확한 `연기금 등` taxonomy 매핑이 미검증 상태다. KIS `기금`으로 이를 대체하지 않는다.
+- KIS 날짜 cursor의 최대 과거 경계와 계정 전체의 보장된 호출 한도는 확인하지 않았다.
+- KRX 실제 rows가 확보되면 `source_as_of <= available_data_cutoff` 및 `ingested_at_kst <= available_data_cutoff`를 강제하고, cutoff 이후 확정·정정 수급이 과거 run에 섞이지 않는 no-look-ahead test를 Gate B 증적에 포함한다.
+
+## 검증 안전성
+
+이번 KIS 검증은 OAuth와 read-only 시세 GET만 사용했다. 주문, 잔고, 보유종목 또는 계좌 endpoint는 호출하지 않았고 토큰·키·raw 인증 payload를 로그에 남기거나 저장하지 않았다.
