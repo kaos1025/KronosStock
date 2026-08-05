@@ -31,6 +31,43 @@ MEMORY_FEATURES = {
     "hbm": ("hbm_supply_tightness", "hbm_indicator"),
 }
 
+# 계약: LICENSE_BLOCKED taxonomy / display_policy / 정책 URL 은 HTML·JSON 응답에
+# 절대 싣지 않는다. 외부로 나가는 상태는 일반화된 값으로만 표기한다.
+_PUBLIC_UNAVAILABLE = "UNAVAILABLE"
+_PUBLIC_RESTRICTED_SOURCE = "restricted_source"
+
+# 공개 응답 금지 마커(소문자 비교). URL 은 스킴/`www.` 접두 형태만 매칭하는
+# 보수적 전략 — trendforce_dramexchange_memory_license_review 같은
+# 일반 벤더 라벨은 가리지 않는다.
+_FORBIDDEN_PUBLIC_MARKERS = (
+    "license_blocked",
+    "display_policy",
+    "do_not_display_or_score",
+    "source_url",
+    "terms_url",
+    "http://",
+    "https://",
+    "www.",
+)
+
+
+def _has_forbidden_public_text(text: Any) -> bool:
+    """공개 응답에 실리면 안 되는 taxonomy/정책/URL 마커 검사 (대소문자 무관)."""
+    if not isinstance(text, str):
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _FORBIDDEN_PUBLIC_MARKERS)
+
+
+def _public_status(status: Any) -> Any:
+    """원장 내부 상태를 공개 응답용 상태로 일반화한다 (대소문자·URL 변형 포함)."""
+    return _PUBLIC_UNAVAILABLE if _has_forbidden_public_text(status) else status
+
+
+def _public_source_name(name: Any) -> Any:
+    """금지 텍스트를 담은 source_name 은 원문 대신 일반 라벨로 대체한다."""
+    return _PUBLIC_RESTRICTED_SOURCE if _has_forbidden_public_text(name) else name
+
 
 def ledger_path() -> Path:
     return Path(os.environ.get("KSF_LEDGER_DB_PATH", str(DEFAULT_LEDGER_PATH)))
@@ -66,7 +103,13 @@ def _text_list(values: list[Any]) -> list[str]:
 
 def _safe_explanation(values: list[str]) -> list[str]:
     forbidden = ("rank", "relative", "pair", "order", "buy", "sell", "매수", "매도", "상대", "대비", "비교", "순위")
-    return [value for value in values if not any(term in value.lower() for term in forbidden)]
+    return [
+        value
+        for value in values
+        # taxonomy/정책/URL 마커가 섞인 설명은 문자열 전체를 폐기한다.
+        if not _has_forbidden_public_text(value)
+        and not any(term in value.lower() for term in forbidden)
+    ]
 
 
 def _feature_value(rows: dict[str, sqlite3.Row], aliases: tuple[str, ...]) -> dict[str, Any]:
@@ -74,19 +117,31 @@ def _feature_value(rows: dict[str, sqlite3.Row], aliases: tuple[str, ...]) -> di
     if row is None:
         return {"value": None, "status": "MISSING"}
     status = row["feature_status"]
-    if status == "LICENSE_BLOCKED":
-        # 라이선스 차단 항목은 value_json 을 파싱하지 않는다 — 값/메타데이터 전부 비노출.
-        return {"value": None, "status": status, "source_as_of": row["source_as_of"]}
+    if _has_forbidden_public_text(status):
+        # 라이선스 차단 항목(대소문자 변형 포함)은 value_json 을 파싱하지 않는다 —
+        # 값/메타데이터 전부 비노출. 원시 taxonomy 도 계약 위반이므로 상태 역시
+        # 일반화해서 내보낸다.
+        return {"value": None, "status": _PUBLIC_UNAVAILABLE, "source_as_of": row["source_as_of"]}
     payload: Any = None
     if row["value_json"]:
         try:
             payload = json.loads(row["value_json"])
         except json.JSONDecodeError:
-            # 깨진 metadata 는 정책을 싣지 못한다 — 아래 스칼라 컬럼 값은 그대로 유효.
+            if _has_forbidden_public_text(row["value_json"]):
+                # 파싱은 안 되지만 정책/URL 마커가 보이는 payload — 스칼라 fallback
+                # 없이 fail-closed 한다 (malformed 정책 JSON 으로 억제를 우회 금지).
+                return {"value": None, "status": _PUBLIC_UNAVAILABLE, "source_as_of": row["source_as_of"]}
+            # 정책과 무관하게 깨진 metadata — 아래 스칼라 컬럼 값은 그대로 유효.
             payload = None
     if isinstance(payload, dict):
         # display_policy 는 value_num/value_text 존재 여부와 무관하게 항상 먼저 평가한다.
-        if payload.get("display_policy") == "do_not_display_or_score":
+        # 키/값 모두 대소문자 변형을 방어한다 — 서로 다른 케이스의 중복 키가 있어도
+        # 하나라도 차단을 명시하면 fail-closed.
+        if any(
+            isinstance(key, str) and key.lower() == "display_policy"
+            and isinstance(policy, str) and policy.lower() == "do_not_display_or_score"
+            for key, policy in payload.items()
+        ):
             return {"value": None, "status": status, "source_as_of": row["source_as_of"]}
         # dict payload 는 metadata 컨테이너 — URL/정책 문자열이 실릴 수 있으므로
         # 원본 dict 를 그대로 노출하지 않고 "value" 키만 꺼낸다.
@@ -122,7 +177,7 @@ def _empty_card(symbol: str, name: str) -> dict[str, Any]:
         },
         "domestic_flow": {},
         "global_environment": {},
-        "memory_indicators": {"license_blocked": False},
+        "memory_indicators": {},
         "evidence": [],
         "counterarguments": ["확인 가능한 기준 데이터가 없습니다."],
         "prior_performance": [],
@@ -230,14 +285,17 @@ def _build_card(conn: sqlite3.Connection, symbol: str) -> dict[str, Any]:
     fallback_evidence, fallback_counters = _fallback_explanation(decision)
     evidence = _safe_explanation(_text_list(_json_list(ai["drivers_json"]))) if ai else []
     counters = _safe_explanation(_text_list(_json_list(ai["risks_json"]))) if ai else []
-    statuses = [row["feature_status"] for row in feature_rows]
+    # rogue 대소문자 변형이 들어와도 결측/신선도 집계는 정직하게 유지한다.
+    statuses = [
+        status.upper() if isinstance(status, str) else status
+        for status in (row["feature_status"] for row in feature_rows)
+    ]
     has_stale = run["run_status"] == "STALE_DATA" or "STALE" in statuses
     has_missing = any(status in {"MISSING_OPTIONAL", "MISSING_REQUIRED", "LICENSE_BLOCKED"} for status in statuses)
     if run["run_status"] in {"PARTIAL_DATA", "MISSING_REQUIRED_DATA"}:
         has_missing = True
     state = "stale" if has_stale else "missing" if has_missing else "ready"
     source_as_of_values = [row for row in feature_rows if row["source_as_of"]]
-    license_blocked = any(row["feature_status"] == "LICENSE_BLOCKED" for row in feature_rows)
 
     return {
         "symbol": symbol,
@@ -249,8 +307,10 @@ def _build_card(conn: sqlite3.Connection, symbol: str) -> dict[str, Any]:
             "run_status": run["run_status"],
             "source_statuses": [
                 {
-                    "source": row["source_name"],
-                    "status": row["source_status"],
+                    # 금지 텍스트를 담은 source_name 은 원문 대신 일반 라벨만 노출.
+                    "source": _public_source_name(row["source_name"]),
+                    # rogue/미래 상태값이 원장에 들어와도 taxonomy 는 새지 않는다.
+                    "status": _public_status(row["source_status"]),
                     "quality": row["quality_grade"],
                     "source_as_of": row["source_as_of"],
                 }
@@ -270,8 +330,7 @@ def _build_card(conn: sqlite3.Connection, symbol: str) -> dict[str, Any]:
             key: _feature_value(features, aliases) for key, aliases in GLOBAL_FEATURES.items()
         },
         "memory_indicators": {
-            **{key: _feature_value(features, aliases) for key, aliases in MEMORY_FEATURES.items()},
-            "license_blocked": license_blocked,
+            key: _feature_value(features, aliases) for key, aliases in MEMORY_FEATURES.items()
         },
         "evidence": evidence or fallback_evidence,
         "counterarguments": counters or fallback_counters,

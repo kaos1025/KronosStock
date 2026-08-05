@@ -26,6 +26,8 @@ SYMBOLS = ("005930", "000660")
 FORBIDDEN = (
     "rank", "relative_rank", "pair_signal", "order", "buy", "sell",
     "매수", "매도", "상대", "대비", "비교", "순위",
+    # 라이선스 taxonomy/정책 메타데이터는 어떤 공개 응답에도 실리면 안 된다.
+    "license_blocked", "do_not_display_or_score", "display_policy",
 )
 
 
@@ -266,7 +268,9 @@ def test_card_merges_feature_families_by_absolute_cutoff_and_symbol(tmp_path: Pa
         samsung["memory_indicators"][name]["value"] is not None
         for name in ("mu", "dram", "nand", "hbm")
     )
-    assert samsung["memory_indicators"]["license_blocked"] is True
+    # 차단 항목은 공개 boolean 으로 노출하지 않는다 — 결측 플래그로만 정직하게 반영.
+    assert "license_blocked" not in samsung["memory_indicators"]
+    assert samsung["data_quality"]["has_missing"] is True
     assert samsung["data_quality"]["has_stale"] is True
     assert cards["000660"]["domestic_flow"]["foreign"]["value"] == 660.0
 
@@ -637,8 +641,12 @@ def policy_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient
     return TestClient(app)
 
 
+# LICENSE_BLOCKED taxonomy 자체가 금지어다 — 원시 상태값(대소문자 무관)과 공개
+# boolean 키("license_blocked") 모두 커버한다. 값/정책 메타데이터 금지어와 합쳐
+# 소문자 비교로 검사한다.
 _POLICY_FORBIDDEN = (
-    "display_policy", "do_not_display_or_score", "source_url", "terms_url",
+    "license_blocked", "display_policy", "do_not_display_or_score",
+    "source_url", "terms_url",
     "vendor.example.com", "licensed-feed", "restricted-metadata", "0.91",
     "blocked.example", "4271.5", "restricted-directional-call",
 )
@@ -649,31 +657,155 @@ def test_license_blocked_feature_value_is_suppressed_in_api(policy_client: TestC
     assert detail.status_code == 200
     card = detail.json()
     hbm = card["memory_indicators"]["hbm"]
+    # 차단 입력은 일반화된 UNAVAILABLE 로만 노출된다 — 원시 taxonomy 는 안전하지 않다.
     assert hbm == {
         "value": None,
-        "status": "LICENSE_BLOCKED",
+        "status": "UNAVAILABLE",
         "source_as_of": "2026-08-01T07:00:00+00:00",
     }
     nand = card["memory_indicators"]["nand"]
     assert nand["value"] is None
-    # 안전한 license_blocked 표시는 유지된다.
-    assert card["memory_indicators"]["license_blocked"] is True
+    # 공개 license_blocked boolean 은 계약 위반이므로 존재하지 않아야 한다.
+    assert "license_blocked" not in card["memory_indicators"]
     for needle in _POLICY_FORBIDDEN:
-        assert needle not in detail.text, needle
+        assert needle not in detail.text.lower(), needle
     listing = policy_client.get("/ksf/cards", headers=_auth())
     assert listing.status_code == 200
     for needle in _POLICY_FORBIDDEN:
-        assert needle not in listing.text, needle
+        assert needle not in listing.text.lower(), needle
 
 
 def test_license_blocked_feature_value_is_suppressed_in_html(policy_client: TestClient):
     page = policy_client.get("/ksf/005930", headers=_auth())
     assert page.status_code == 200
     for needle in _POLICY_FORBIDDEN:
-        assert needle not in page.text, needle
+        assert needle not in page.text.lower(), needle
     # dict 가 str() 로 렌더링돼 새는 경우가 없어야 한다.
     assert "{'" not in page.text and "&#x27;value&#x27;" not in page.text
-    assert "LICENSE_BLOCKED" in page.text  # 안전한 상태 표시는 유지
+    assert "UNAVAILABLE" in page.text  # 일반화된 상태 표시만 유지
+
+
+# --- 릴리스 블로커(356731c 프로덕션 스모크): taxonomy 는 4개 엔드포인트 어디에도 없다 ---
+
+_KSF_ENDPOINTS = ("/ksf/cards", "/ksf/cards/005930", "/ksf", "/ksf/005930")
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_base_fixture_license_taxonomy_never_serialized(client: TestClient, path: str):
+    """기본 fixture 는 LICENSE_BLOCKED 행(memory_license)을 이미 포함한다."""
+    response = client.get(path, headers=_auth())
+    assert response.status_code == 200
+    text = response.text.lower()
+    for needle in ("license_blocked", "do_not_display_or_score", "display_policy",
+                   "source_url", "terms_url"):
+        assert needle not in text, needle
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_policy_ledger_license_taxonomy_never_serialized(policy_client: TestClient, path: str):
+    response = policy_client.get(path, headers=_auth())
+    assert response.status_code == 200
+    text = response.text.lower()
+    for needle in _POLICY_FORBIDDEN:
+        assert needle not in text, needle
+
+
+def test_memory_indicators_expose_only_indicator_keys(client: TestClient):
+    for card in client.get("/ksf/cards", headers=_auth()).json()["cards"]:
+        assert set(card["memory_indicators"]) == {"mu", "dram", "nand", "hbm"}
+
+
+def test_empty_card_contract_has_no_license_blocked_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db_path = tmp_path / "empty-taxonomy.sqlite3"
+    _make_ledger(db_path, populated=False)
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    response = TestClient(app).get("/ksf/cards", headers=_auth())
+    assert response.status_code == 200
+    assert "license_blocked" not in response.text.lower()
+    for card in response.json()["cards"]:
+        assert card["memory_indicators"] == {}
+        # 결측 자체는 계속 정직하게 표시한다.
+        assert card["data_quality"]["has_missing"] is True
+
+
+def test_blocked_input_still_drives_missing_state_truthfully(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """차단 입력의 결측 기여(has_missing/state)는 숨기지 않되 taxonomy 는 일반화한다."""
+    db_path = tmp_path / "truthful.sqlite3"
+    _make_ledger(db_path, populated=False)
+    conn = sqlite3.connect(db_path)
+    _insert_run_feature(
+        conn, run_id="truthful-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="truthful-nvda", feature_name="nvda_adjusted_close", value=190.0,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+    )
+    _insert_run_feature(
+        conn, run_id="truthful-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="truthful-hbm", feature_name="hbm_supply_tightness", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        status="LICENSE_BLOCKED", missing_reason="license review",
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    detail = TestClient(app).get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    assert card["data_quality"]["has_missing"] is True
+    assert card["data_quality"]["has_stale"] is False
+    assert card["data_quality"]["state"] == "missing"
+    assert card["memory_indicators"]["hbm"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "license_blocked" not in detail.text.lower()
+
+
+def test_rogue_license_blocked_source_status_is_sanitized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """source_statuses 대체 경로도 taxonomy 를 새지 않는다.
+
+    스키마 CHECK 는 이 값을 허용하지 않지만, 미래 마이그레이션/수동 조작으로
+    들어온 rogue 행까지 방어해야 하므로 CHECK 를 끄고 주입해 검증한다.
+    """
+    db_path = tmp_path / "rogue-source.sqlite3"
+    _make_ledger(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    conn.execute(
+        """INSERT INTO ksf_collected_source_metadata
+           (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+           VALUES ('rogue-meta', 'memory_license_review', '2026-08-01', 'D', 'NONE')"""
+    )
+    conn.execute(
+        """INSERT INTO ksf_source_snapshots
+           (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+            source_kind, source_status, source_as_of, ingested_at_kst,
+            available_data_cutoff, quality_grade, missing_reason)
+           VALUES ('rogue-snapshot', NULL, '005930', 'rogue-meta',
+                   'memory_license_review', 'memory_license_review',
+                   'LICENSE_BLOCKED', '2026-08-01T06:30:00+00:00',
+                   '2026-08-01T15:30:00+09:00', '2026-08-01T15:59:00+09:00',
+                   'D', 'license review')"""
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    client = TestClient(app)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    statuses = {
+        row["source"]: row["status"]
+        for row in detail.json()["data_quality"]["source_statuses"]
+    }
+    assert statuses["memory_license_review"] == "UNAVAILABLE"
+    assert "license_blocked" not in detail.text.lower()
+    page = client.get("/ksf/005930", headers=_auth())
+    assert "license_blocked" not in page.text.lower()
 
 
 # --- Hermes blocker A: display_policy 는 value_num/value_text 존재와 무관하게 평가 ---
@@ -722,9 +854,10 @@ def test_license_blocked_short_circuits_without_parsing_value_json(monkeypatch: 
         raise AssertionError("LICENSE_BLOCKED must not parse value_json")
 
     monkeypatch.setattr(web_api.json, "loads", _explode)
+    # 단락은 유지하되, 밖으로 나가는 상태는 원시 taxonomy 가 아닌 일반화된 값이다.
     assert web_api._feature_value({"hbm_supply_tightness": row}, ("hbm_supply_tightness",)) == {
         "value": None,
-        "status": "LICENSE_BLOCKED",
+        "status": "UNAVAILABLE",
         "source_as_of": "2026-08-01T07:00:00+00:00",
     }
 
@@ -916,3 +1049,419 @@ def test_service_execstart_does_not_log_credentials(tmp_path: Path):
         assert secret not in logs, f"credential material leaked into service logs: {secret!r}"
     # 액세스 로그 자체가 꺼져 있어야 한다 (요청 라인 없음).
     assert "GET /ksf" not in logs
+
+
+# --- Codex BLOCKED 3건: malformed 정책 JSON fail-open / AI 설명 미필터 / source_name 미살균 ---
+
+# 정책 마커를 실은 채 잘린(파싱 불가) value_json — 스칼라 fallback 으로 새면 안 된다.
+_MALFORMED_POLICY_JSON = '{"display_policy": "do_not_display_or_score", "source_url": "https://blocked.example'
+_MALFORMED_POLICY_JSON_MIXED_CASE = '{"Display_Policy": "DO_NOT_DISPLAY_OR_SCORE", "Terms_URL": "https://Blocked.Example'
+# 금지 마커를 전혀 담지 않은 일반 벤더 라벨 — 절대 가려지면 안 된다.
+_SAFE_VENDOR_LABEL = "trendforce_dramexchange_memory_license_review"
+_ADV_SAFE_DRIVER = "외국인 수급 우호적"
+_ADV_SAFE_RISK = "메모리 지표 변동성 확대"
+_ADV_DRIVERS = [
+    _ADV_SAFE_DRIVER,
+    "내부 사유: LICENSE_BLOCKED 항목 제외",
+    "자세한 근거는 https://vendor.example.com/report 참고",
+    "Display_Policy=DO_NOT_DISPLAY_OR_SCORE 필터 적용",
+    "출처 www.blocked-vendor.example 참조",
+    "단기 매수 관점",  # 기존 트레이딩 금지어 필터가 계속 동작하는지 확인용
+]
+_ADV_RISKS = [
+    _ADV_SAFE_RISK,
+    "계약 조건은 terms_url 참조: https://vendor.example.com/terms",
+    "SOURCE_URL 재검토 필요",
+]
+_ADV_FORBIDDEN_NEEDLES = (
+    "license_blocked", "display_policy", "do_not_display_or_score",
+    "source_url", "terms_url", "http://", "https://", "www.",
+    "vendor.example.com", "blocked-vendor.example", "blocked.example",
+    "licensed-feed", "6543.25", "8.75", "shielded-directional-text",
+    "export_vendor",
+)
+
+
+@pytest.fixture
+def adversarial_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    db_path = tmp_path / "adversarial.sqlite3"
+    _make_ledger(db_path)
+    conn = sqlite3.connect(db_path)
+    # rogue 대소문자 변형/스키마 외 상태값까지 방어해야 하므로 CHECK 를 끄고 주입한다.
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    # (1) 정책 마커를 실은 malformed value_json + 살아있는 value_num → 스칼라가 새면 안 됨.
+    _insert_run_feature(
+        conn, run_id="adv-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="adv-dram", feature_name="dram_spot_direction", value=6543.25,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json=_MALFORMED_POLICY_JSON,
+    )
+    # 동일 우회를 value_text + 대소문자 변형 마커로 재현.
+    _insert_run_feature(
+        conn, run_id="adv-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="adv-mu", feature_name="mu_adjusted_close", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_text="shielded-directional-text", value_json=_MALFORMED_POLICY_JSON_MIXED_CASE,
+    )
+    # 정책과 무관한 malformed JSON 은 스칼라를 계속 보존해야 한다 (과차단 방지 대조군).
+    _insert_run_feature(
+        conn, run_id="adv-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="adv-soxx", feature_name="soxx_adjusted_close", value=307.25,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json='{"broken',
+    )
+    # 대소문자 변형 LICENSE_BLOCKED 상태 — 값/상태 모두 일반화돼야 한다.
+    _insert_run_feature(
+        conn, run_id="adv-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="adv-nand", feature_name="nand_wafer_direction", value=8.75,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        status="License_Blocked", value_json=_LICENSED_VALUE_JSON,
+    )
+    # (2) AI 설명에 taxonomy/정책/URL 이 섞여 온 경우.
+    conn.execute(
+        """INSERT INTO ksf_ai_requests
+           (ai_request_id, run_id, symbol, purpose, as_of_kst,
+            available_data_cutoff, prompt_template_version,
+            redaction_policy_version, input_ledger_hash_sha256,
+            prompt_hash_sha256, model_provider, model_name)
+           VALUES ('adv-request', 'adv-005930', '005930', 'explain_decision',
+                   '2026-08-01T18:00:00+09:00', '2026-08-01T16:00:00+09:00',
+                   'v1', 'v1', 'adv-input', 'adv-prompt', 'offline', 'fixture')"""
+    )
+    conn.execute(
+        """INSERT INTO ksf_ai_responses
+           (ai_response_id, ai_request_id, run_id, symbol, response_status,
+            response_hash_sha256, summary, drivers_json, risks_json,
+            model_provider, model_name)
+           VALUES ('adv-response', 'adv-request', 'adv-005930', '005930', 'OK',
+                   'adv-hash', '단일 종목 흐름 요약', ?, ?, 'offline', 'fixture')""",
+        (json.dumps(_ADV_DRIVERS, ensure_ascii=False), json.dumps(_ADV_RISKS, ensure_ascii=False)),
+    )
+    # (3) 금지 텍스트를 담은 source_name + 대소문자 변형 상태.
+    for metadata_id, source_name in (
+        ("adv-meta-url", "see https://vendor.example.com/licensed-feed"),
+        ("adv-meta-policy", "display_policy_export_vendor"),
+        ("adv-meta-safe", _SAFE_VENDOR_LABEL),
+    ):
+        conn.execute(
+            """INSERT INTO ksf_collected_source_metadata
+               (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+               VALUES (?, ?, '2026-08-01', 'D', 'NONE')""",
+            (metadata_id, source_name),
+        )
+    for snapshot_id, metadata_id, source_name, source_status, grade in (
+        ("adv-snapshot-url", "adv-meta-url", "see https://vendor.example.com/licensed-feed", "License_Blocked", "C"),
+        ("adv-snapshot-policy", "adv-meta-policy", "display_policy_export_vendor", "COLLECTED", "B"),
+        ("adv-snapshot-safe", "adv-meta-safe", _SAFE_VENDOR_LABEL, "COLLECTED", "A"),
+    ):
+        conn.execute(
+            """INSERT INTO ksf_source_snapshots
+               (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+                source_kind, source_status, source_as_of, ingested_at_kst,
+                available_data_cutoff, quality_grade, missing_reason)
+               VALUES (?, NULL, '005930', ?, ?, 'memory_license_review', ?,
+                       '2026-08-01T06:30:00+00:00', '2026-08-01T15:30:00+09:00',
+                       '2026-08-01T15:59:00+09:00', ?, NULL)""",
+            (snapshot_id, metadata_id, source_name, source_status, grade),
+        )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+def test_malformed_policy_value_json_fails_closed_for_value_num(adversarial_client: TestClient):
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["dram"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "6543.25" not in detail.text
+    assert "blocked.example" not in detail.text.lower()
+
+
+def test_malformed_policy_value_json_fails_closed_for_value_text(adversarial_client: TestClient):
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["mu"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "shielded-directional-text" not in detail.text
+
+
+def test_malformed_unrelated_value_json_still_preserves_scalar(adversarial_client: TestClient):
+    """fail-closed 는 정책 마커가 보일 때만 — 무관한 깨진 JSON 은 기존 스칼라 유지."""
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["global_environment"]["soxx"] == {
+        "value": 307.25,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+
+
+def test_mixed_case_license_blocked_feature_status_fails_closed(adversarial_client: TestClient):
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["nand"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "8.75" not in detail.text
+    assert "license_blocked" not in detail.text.lower()
+
+
+def test_adversarial_ai_explanations_are_dropped_entirely(adversarial_client: TestClient):
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    # 안전한 설명은 보존, 금지 텍스트를 담은 문자열은 문자열 전체를 폐기한다.
+    assert card["evidence"] == [_ADV_SAFE_DRIVER]
+    assert card["counterarguments"] == [_ADV_SAFE_RISK]
+    # 기존 트레이딩 금지어 필터도 그대로 유지된다.
+    assert "매수" not in json.dumps(card, ensure_ascii=False)
+
+
+def test_adversarial_source_name_is_replaced_with_generic_label(adversarial_client: TestClient):
+    detail = adversarial_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    sources = detail.json()["data_quality"]["source_statuses"]
+    by_grade = {row["quality"]: row for row in sources}
+    # 원문 source_name 은 절대 노출하지 않되 행 자체(품질/시각)는 보존한다.
+    assert by_grade["C"] == {
+        "source": "restricted_source",
+        "status": "UNAVAILABLE",  # 대소문자 변형 License_Blocked 도 일반화
+        "quality": "C",
+        "source_as_of": "2026-08-01T06:30:00+00:00",
+    }
+    assert by_grade["B"]["source"] == "restricted_source"
+    assert by_grade["B"]["status"] == "COLLECTED"
+    # 금지 마커가 없는 일반 벤더 라벨은 그대로 유지된다.
+    assert by_grade["A"]["source"] == _SAFE_VENDOR_LABEL
+    assert by_grade["A"]["status"] == "COLLECTED"
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_adversarial_ledger_leaks_nothing_on_any_endpoint(adversarial_client: TestClient, path: str):
+    response = adversarial_client.get(path, headers=_auth())
+    assert response.status_code == 200
+    text = response.text.lower()
+    for needle in _ADV_FORBIDDEN_NEEDLES:
+        assert needle not in text, needle
+    # 안전한 벤더 라벨을 과차단하지 않는다 (source_statuses 는 JSON 응답에만 실린다).
+    if path.startswith("/ksf/cards"):
+        assert _SAFE_VENDOR_LABEL in text
+
+
+def test_mixed_case_blocked_status_still_drives_missing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """대소문자 변형 차단 상태도 내부 결측(has_missing/state)에는 정직하게 반영된다."""
+    db_path = tmp_path / "mixed-case-truthful.sqlite3"
+    _make_ledger(db_path, populated=False)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    _insert_run_feature(
+        conn, run_id="mixed-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixed-nvda", feature_name="nvda_adjusted_close", value=190.0,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+    )
+    _insert_run_feature(
+        conn, run_id="mixed-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixed-hbm", feature_name="hbm_supply_tightness", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        status="License_Blocked", missing_reason="license review",
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    detail = TestClient(app).get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    assert card["data_quality"]["has_missing"] is True
+    assert card["data_quality"]["state"] == "missing"
+    assert card["memory_indicators"]["hbm"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "license_blocked" not in detail.text.lower()
+
+
+def test_public_text_policy_is_case_insensitive_and_conservative():
+    from ksf import web_api
+
+    assert web_api._public_status("LICENSE_BLOCKED") == "UNAVAILABLE"
+    assert web_api._public_status("License_Blocked") == "UNAVAILABLE"
+    assert web_api._public_status("lIcEnSe_bLoCkEd") == "UNAVAILABLE"
+    assert web_api._public_status("BLOCKED_SEE_https://vendor.example") == "UNAVAILABLE"
+    assert web_api._public_status("READY") == "READY"
+    assert web_api._public_status(None) is None
+    assert web_api._public_source_name("Terms_URL_export") == "restricted_source"
+    assert web_api._public_source_name("WWW.evil.example") == "restricted_source"
+    # 일반 벤더 라벨은 보수적 URL 전략으로 인해 가려지지 않는다.
+    assert web_api._public_source_name(_SAFE_VENDOR_LABEL) == _SAFE_VENDOR_LABEL
+
+
+# --- Codex BLOCKED (신규 HIGH): 유효 JSON + 대소문자 변형 정책 키가 억제를 우회 ---
+
+# 파싱에 성공하는 유효 dict 인데 정책 키/값이 대소문자 변형이다 —
+# payload.get("display_policy") 는 키를 exact-match 하므로 우회되고
+# value_num/value_text/JSON 스칼라가 그대로 노출된다.
+_MIXED_CASE_POLICY_JSON = json.dumps({
+    "Display_Policy": "DO_NOT_DISPLAY_OR_SCORE",
+    "Source_URL": "https://mixed-blocked.example/feed",
+})
+_MIXED_CASE_POLICY_SCALAR_JSON = json.dumps({
+    "Display_Policy": "Do_Not_Display_Or_Score",
+    "value": 6211.5,
+})
+# 서로 다른 케이스의 중복 display_policy 키 — 하나라도 차단을 명시하면 fail-closed.
+_DUPLICATE_CASE_POLICY_JSON = (
+    '{"display_policy": "unrelated_note", '
+    '"DISPLAY_POLICY": "dO_nOt_DiSpLaY_oR_sCoRe", "value": 913.25}'
+)
+# 대조군: 대소문자 변형 정책 키라도 값이 차단이 아니면 스칼라 추출은 유지된다.
+_MIXED_CASE_NON_BLOCKING_JSON = json.dumps({
+    "Display_Policy": "OK_TO_DISPLAY",
+    "value": 351.75,
+})
+
+_MIXED_CASE_FORBIDDEN = (
+    "7433.25", "mixedcase-directional-text", "6211.5", "913.25",
+    "mixed-blocked.example", "display_policy", "do_not_display_or_score",
+    "source_url",
+)
+
+
+@pytest.fixture
+def mixed_case_policy_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    db_path = tmp_path / "mixed-case-policy.sqlite3"
+    _make_ledger(db_path)
+    conn = sqlite3.connect(db_path)
+    # value_num 이 살아있는 행 + 대소문자 변형 정책 dict.
+    _insert_run_feature(
+        conn, run_id="mixedcase-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixedcase-dram", feature_name="dram_spot_direction", value=7433.25,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json=_MIXED_CASE_POLICY_JSON,
+    )
+    # 동일 우회를 value_text 경로에서 재현.
+    _insert_run_feature(
+        conn, run_id="mixedcase-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixedcase-mu", feature_name="mu_adjusted_close", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_text="mixedcase-directional-text", value_json=_MIXED_CASE_POLICY_JSON,
+    )
+    # 스칼라 컬럼이 모두 NULL — dict 의 "value" 스칼라 fallback 이 새는 경로.
+    _insert_run_feature(
+        conn, run_id="mixedcase-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixedcase-hbm", feature_name="hbm_supply_tightness", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json=_MIXED_CASE_POLICY_SCALAR_JSON,
+    )
+    # 서로 다른 케이스의 중복 정책 키 — 하나라도 차단이면 전부 억제돼야 한다.
+    _insert_run_feature(
+        conn, run_id="mixedcase-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixedcase-nand", feature_name="nand_wafer_direction", value=913.25,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json=_DUPLICATE_CASE_POLICY_JSON,
+    )
+    # 대조군: 차단이 아닌 정책 값은 과차단 없이 스칼라를 유지한다.
+    _insert_run_feature(
+        conn, run_id="mixedcase-005930", symbol="005930",
+        as_of="2026-08-01T18:00:00+09:00", cutoff="2026-08-01T16:00:00+09:00",
+        feature_id="mixedcase-soxx", feature_name="soxx_adjusted_close", value=None,
+        source_as_of="2026-08-01T07:00:00+00:00", ingested_at="2026-08-01T15:58:00+09:00",
+        value_json=_MIXED_CASE_NON_BLOCKING_JSON,
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+def test_mixed_case_policy_key_suppresses_value_num(mixed_case_policy_client: TestClient):
+    detail = mixed_case_policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["dram"] == {
+        "value": None,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "7433.25" not in detail.text
+
+
+def test_mixed_case_policy_key_suppresses_value_text(mixed_case_policy_client: TestClient):
+    detail = mixed_case_policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["mu"] == {
+        "value": None,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "mixedcase-directional-text" not in detail.text
+
+
+def test_mixed_case_policy_key_suppresses_json_scalar_value(mixed_case_policy_client: TestClient):
+    detail = mixed_case_policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["hbm"] == {
+        "value": None,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "6211.5" not in detail.text
+
+
+def test_duplicate_cased_policy_keys_fail_closed_if_any_blocks(mixed_case_policy_client: TestClient):
+    detail = mixed_case_policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["memory_indicators"]["nand"] == {
+        "value": None,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+    assert "913.25" not in detail.text
+
+
+def test_mixed_case_non_blocking_policy_value_preserves_scalar(mixed_case_policy_client: TestClient):
+    """정책 키가 대소문자 변형이어도 값이 차단이 아니면 과차단하지 않는다."""
+    detail = mixed_case_policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["global_environment"]["soxx"] == {
+        "value": 351.75,
+        "status": "READY",
+        "source_as_of": "2026-08-01T07:00:00+00:00",
+    }
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_mixed_case_policy_ledger_leaks_nothing_on_any_endpoint(
+    mixed_case_policy_client: TestClient, path: str
+):
+    response = mixed_case_policy_client.get(path, headers=_auth())
+    assert response.status_code == 200
+    text = response.text.lower()
+    for needle in _MIXED_CASE_FORBIDDEN:
+        assert needle not in text, needle
