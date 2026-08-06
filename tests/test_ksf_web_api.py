@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -64,7 +65,9 @@ def _make_ledger(path: Path, *, populated: bool = True) -> None:
             "hbm_supply_tightness": 0.8,
         }
         for feature_index, (name, value) in enumerate(features.items()):
-            status = "STALE" if name == "dram_price" else "READY"
+            # 005930(STALE_DATA run)만 STALE 피처를 갖는다. 000660 은 프로덕션과 동일한
+            # 비 stale PARTIAL_DATA 카드로 유지해 partial headline 계약을 검증한다.
+            status = "STALE" if name == "dram_price" and index == 0 else "READY"
             conn.execute(
                 """INSERT INTO ksf_normalized_features
                    (feature_id, run_id, symbol, feature_group, feature_name,
@@ -182,6 +185,7 @@ def _insert_run_feature(
     value_text: str | None = None,
     value_json: str | None = None,
     missing_reason: str | None = None,
+    unit: str | None = None,
 ) -> None:
     conn.execute(
         """INSERT OR IGNORE INTO ksf_runs
@@ -193,10 +197,10 @@ def _insert_run_feature(
         """INSERT INTO ksf_normalized_features
            (feature_id, run_id, symbol, feature_group, feature_name,
             feature_version, feature_status, value_num, value_text, value_json,
-            source_as_of, ingested_at_kst, available_data_cutoff, missing_reason)
-           VALUES (?, ?, ?, 'regression', ?, 'v1', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            unit, source_as_of, ingested_at_kst, available_data_cutoff, missing_reason)
+           VALUES (?, ?, ?, 'regression', ?, 'v1', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (feature_id, run_id, symbol, feature_name, status, value, value_text,
-         value_json, source_as_of, ingested_at, cutoff, missing_reason),
+         value_json, unit, source_as_of, ingested_at, cutoff, missing_reason),
     )
 
 
@@ -338,7 +342,8 @@ def test_empty_ledger_returns_no_data_cards(tmp_path: Path, monkeypatch: pytest.
     assert detail.json()["data_quality"]["state"] == "no_data"
     page = client.get("/ksf/005930", headers=_auth())
     assert page.status_code == 200
-    assert "no_data" in page.text
+    # HTML 은 raw taxonomy 대신 한국어 공개 라벨을 렌더링한다 (JSON 은 no_data 유지).
+    assert "데이터 없음" in page.text
 
 
 @pytest.mark.parametrize("path", ["/ksf", "/ksf/005930"])
@@ -682,7 +687,8 @@ def test_license_blocked_feature_value_is_suppressed_in_html(policy_client: Test
         assert needle not in page.text.lower(), needle
     # dict 가 str() 로 렌더링돼 새는 경우가 없어야 한다.
     assert "{'" not in page.text and "&#x27;value&#x27;" not in page.text
-    assert "UNAVAILABLE" in page.text  # 일반화된 상태 표시만 유지
+    # 차단 항목은 HTML 에서 한국어 공개 라벨(사용 제한)로만 표기한다.
+    assert "사용 제한" in page.text
 
 
 # --- 릴리스 블로커(356731c 프로덕션 스모크): taxonomy 는 4개 엔드포인트 어디에도 없다 ---
@@ -729,8 +735,9 @@ def test_empty_card_contract_has_no_license_blocked_key(tmp_path: Path, monkeypa
         assert card["data_quality"]["has_missing"] is True
 
 
-def test_blocked_input_still_drives_missing_state_truthfully(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """차단 입력의 결측 기여(has_missing/state)는 숨기지 않되 taxonomy 는 일반화한다."""
+def test_blocked_only_input_headlines_restricted_and_preserves_missing_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """차단 전용 입력은 공개 상태 restricted 로 표기하되 has_missing 진실은 유지하고
+    taxonomy 는 계속 일반화한다 (승인된 B 리서치 데스크 상태 계약)."""
     db_path = tmp_path / "truthful.sqlite3"
     _make_ledger(db_path, populated=False)
     conn = sqlite3.connect(db_path)
@@ -756,7 +763,9 @@ def test_blocked_input_still_drives_missing_state_truthfully(tmp_path: Path, mon
     card = detail.json()
     assert card["data_quality"]["has_missing"] is True
     assert card["data_quality"]["has_stale"] is False
-    assert card["data_quality"]["state"] == "missing"
+    # 결측/부분 신호 없이 차단 항목만 있으면 공개 상태는 missing 이 아니라 restricted.
+    assert card["data_quality"]["state"] == "restricted"
+    assert card["data_quality"].get("has_restricted") is True
     assert card["memory_indicators"]["hbm"] == {
         "value": None,
         "status": "UNAVAILABLE",
@@ -882,6 +891,7 @@ def test_malformed_unrelated_value_json_keeps_scalar_value(tmp_path: Path, monke
     assert detail.json()["global_environment"]["nvda"] == {
         "value": 190.5,
         "status": "READY",
+        "unit": "USD",
         "source_as_of": "2026-08-01T07:00:00+00:00",
     }
 
@@ -1207,6 +1217,7 @@ def test_malformed_unrelated_value_json_still_preserves_scalar(adversarial_clien
     assert detail.json()["global_environment"]["soxx"] == {
         "value": 307.25,
         "status": "READY",
+        "unit": "USD",
         "source_as_of": "2026-08-01T07:00:00+00:00",
     }
 
@@ -1265,8 +1276,9 @@ def test_adversarial_ledger_leaks_nothing_on_any_endpoint(adversarial_client: Te
         assert _SAFE_VENDOR_LABEL in text
 
 
-def test_mixed_case_blocked_status_still_drives_missing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """대소문자 변형 차단 상태도 내부 결측(has_missing/state)에는 정직하게 반영된다."""
+def test_mixed_case_blocked_status_headlines_restricted_and_preserves_missing_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """대소문자 변형 차단 상태도 has_missing/has_restricted 에 정직하게 반영되며
+    공개 상태는 restricted 로 표기된다."""
     db_path = tmp_path / "mixed-case-truthful.sqlite3"
     _make_ledger(db_path, populated=False)
     conn = sqlite3.connect(db_path)
@@ -1292,7 +1304,8 @@ def test_mixed_case_blocked_status_still_drives_missing_state(tmp_path: Path, mo
     assert detail.status_code == 200
     card = detail.json()
     assert card["data_quality"]["has_missing"] is True
-    assert card["data_quality"]["state"] == "missing"
+    assert card["data_quality"]["state"] == "restricted"
+    assert card["data_quality"].get("has_restricted") is True
     assert card["memory_indicators"]["hbm"] == {
         "value": None,
         "status": "UNAVAILABLE",
@@ -1452,6 +1465,7 @@ def test_mixed_case_non_blocking_policy_value_preserves_scalar(mixed_case_policy
     assert detail.json()["global_environment"]["soxx"] == {
         "value": 351.75,
         "status": "READY",
+        "unit": "USD",
         "source_as_of": "2026-08-01T07:00:00+00:00",
     }
 
@@ -1465,3 +1479,1082 @@ def test_mixed_case_policy_ledger_leaks_nothing_on_any_endpoint(
     text = response.text.lower()
     for needle in _MIXED_CASE_FORBIDDEN:
         assert needle not in text, needle
+
+
+# --- 승인된 KSF B 리서치 데스크 계약: 공개 상태 taxonomy + has_restricted + 한국어 라벨 ---
+#
+# 우선순위: stale > missing > partial > restricted > ready. 빈 원장은 no_data 유지.
+# has_restricted 는 차단 피처/차단 소스가 실재할 때 true 이되, 원시 taxonomy/정책/URL/
+# 소스 라벨 억제 계약은 그대로 유지된다.
+
+_STATE_AS_OF = "2026-08-01T18:00:00+09:00"
+_STATE_CUTOFF = "2026-08-01T16:00:00+09:00"
+_STATE_SOURCE_AS_OF = "2026-08-01T06:00:00+00:00"
+_STATE_INGESTED = "2026-08-01T15:58:00+09:00"
+
+_READY_FEATURES = (
+    ("nvda_adjusted_close", 190.0, "READY"),
+    ("foreign_net_flow", 500.0, "READY"),
+)
+
+
+def _make_state_ledger(
+    db_path: Path,
+    *,
+    run_status: str,
+    features: tuple[tuple[str, float | None, str], ...],
+    blocked_source: bool = False,
+) -> None:
+    """단일 run 원장 — run_status/feature_status 조합으로 공개 상태 계약을 재현한다."""
+    _make_ledger(db_path, populated=False)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO ksf_runs
+           (run_id, symbol, trading_date, run_status, as_of_kst, available_data_cutoff)
+           VALUES ('state-run', '005930', '2026-08-01', ?, ?, ?)""",
+        (run_status, _STATE_AS_OF, _STATE_CUTOFF),
+    )
+    for index, (name, value, status) in enumerate(features):
+        missing_reason = None
+        if status in {"MISSING_OPTIONAL", "MISSING_REQUIRED", "LICENSE_BLOCKED"}:
+            missing_reason = "state fixture"
+        _insert_run_feature(
+            conn, run_id="state-run", symbol="005930",
+            as_of=_STATE_AS_OF, cutoff=_STATE_CUTOFF,
+            feature_id=f"state-feature-{index}", feature_name=name, value=value,
+            source_as_of=_STATE_SOURCE_AS_OF, ingested_at=_STATE_INGESTED,
+            status=status, missing_reason=missing_reason,
+        )
+    if blocked_source:
+        # 스키마가 허용하는 유일한 차단 소스 표현: BLOCKED_REVIEW + quality BLOCKED.
+        conn.execute(
+            """INSERT INTO ksf_collected_source_metadata
+               (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+               VALUES ('state-meta', 'memory_vendor_review', '2026-08-01', 'BLOCKED', 'NONE')"""
+        )
+        conn.execute(
+            """INSERT INTO ksf_source_snapshots
+               (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+                source_kind, source_status, source_as_of, ingested_at_kst,
+                available_data_cutoff, quality_grade)
+               VALUES ('state-snapshot', NULL, '005930', 'state-meta',
+                       'memory_vendor_review', 'memory_license_review', 'BLOCKED_REVIEW',
+                       ?, ?, ?, 'BLOCKED')""",
+            (_STATE_SOURCE_AS_OF, _STATE_INGESTED, _STATE_CUTOFF),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _state_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_status: str,
+    features: tuple[tuple[str, float | None, str], ...],
+    blocked_source: bool = False,
+) -> TestClient:
+    db_path = tmp_path / "state.sqlite3"
+    _make_state_ledger(
+        db_path, run_status=run_status, features=features, blocked_source=blocked_source
+    )
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+_STATE_PRECEDENCE_CASES = [
+    pytest.param(
+        "READY", _READY_FEATURES,
+        {"state": "ready", "has_stale": False, "has_missing": False, "has_restricted": False},
+        id="ready",
+    ),
+    pytest.param(
+        "PARTIAL_DATA", _READY_FEATURES,
+        {"state": "partial", "has_missing": True, "has_restricted": False},
+        id="partial-from-run-status",
+    ),
+    pytest.param(
+        "READY", _READY_FEATURES + (("dram_price", None, "MISSING_OPTIONAL"),),
+        {"state": "partial", "has_missing": True, "has_restricted": False},
+        id="partial-from-missing-optional-feature",
+    ),
+    pytest.param(
+        "MISSING_REQUIRED_DATA", _READY_FEATURES,
+        {"state": "missing", "has_missing": True, "has_restricted": False},
+        id="missing-from-run-status",
+    ),
+    pytest.param(
+        "READY", _READY_FEATURES + (("institution_net_flow", None, "MISSING_REQUIRED"),),
+        {"state": "missing", "has_missing": True, "has_restricted": False},
+        id="missing-from-required-feature",
+    ),
+    pytest.param(
+        "PARTIAL_DATA", _READY_FEATURES + (("institution_net_flow", None, "MISSING_REQUIRED"),),
+        {"state": "missing", "has_missing": True, "has_restricted": False},
+        id="missing-beats-partial",
+    ),
+    pytest.param(
+        "READY", _READY_FEATURES + (("hbm_supply_tightness", None, "LICENSE_BLOCKED"),),
+        {"state": "restricted", "has_missing": True, "has_restricted": True},
+        id="restricted-only-blocked-feature",
+    ),
+    pytest.param(
+        "PARTIAL_DATA", _READY_FEATURES + (("hbm_supply_tightness", None, "LICENSE_BLOCKED"),),
+        {"state": "partial", "has_missing": True, "has_restricted": True},
+        id="partial-beats-restricted",
+    ),
+    pytest.param(
+        "STALE_DATA",
+        _READY_FEATURES
+        + (("institution_net_flow", None, "MISSING_REQUIRED"),
+           ("hbm_supply_tightness", None, "LICENSE_BLOCKED")),
+        {"state": "stale", "has_stale": True, "has_missing": True, "has_restricted": True},
+        id="stale-wins-over-everything",
+    ),
+    pytest.param(
+        "PARTIAL_DATA", _READY_FEATURES + (("dram_price", 2.0, "STALE"),),
+        {"state": "stale", "has_stale": True, "has_restricted": False},
+        id="stale-feature-beats-partial",
+    ),
+]
+
+
+@pytest.mark.parametrize("run_status,features,expected", _STATE_PRECEDENCE_CASES)
+def test_public_state_taxonomy_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    run_status: str, features: tuple, expected: dict,
+):
+    client = _state_client(tmp_path, monkeypatch, run_status=run_status, features=features)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    for key, value in expected.items():
+        assert quality.get(key) == value, f"{key}: expected {value!r}, got {quality.get(key)!r}"
+
+
+def test_blocked_source_only_headlines_restricted_without_faking_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """피처는 전부 READY 이고 차단 소스만 있으면 restricted — 결측을 지어내지 않는다."""
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="READY", features=_READY_FEATURES,
+        blocked_source=True,
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality["state"] == "restricted"
+    assert quality.get("has_restricted") is True
+    assert quality["has_missing"] is False
+    assert quality["has_stale"] is False
+
+
+def test_has_restricted_true_for_blocked_features_without_leaking_taxonomy(policy_client: TestClient):
+    """has_restricted 는 진실을 말하되 원시 taxonomy/정책/URL 억제는 그대로 유지된다."""
+    detail = policy_client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["data_quality"].get("has_restricted") is True
+    text = detail.text.lower()
+    for needle in _POLICY_FORBIDDEN:
+        assert needle not in text, needle
+
+
+def test_empty_ledger_cards_keep_no_data_and_report_no_restricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "empty-restricted.sqlite3"
+    _make_ledger(db_path, populated=False)
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    response = TestClient(app).get("/ksf/cards", headers=_auth())
+    assert response.status_code == 200
+    for card in response.json()["cards"]:
+        assert card["data_quality"]["state"] == "no_data"
+        assert card["data_quality"]["has_missing"] is True
+        assert card["data_quality"].get("has_restricted") is False
+
+
+def test_base_fixture_headlines_partial_with_restricted_qualifier(client: TestClient):
+    """프로덕션 재현 fixture: PARTIAL_DATA 종목은 raw missing 이 아니라 partial 을
+    headline 하고, 차단 항목/결측 진실(has_restricted/has_missing)은 유지한다."""
+    cards = {
+        card["symbol"]: card["data_quality"]
+        for card in client.get("/ksf/cards", headers=_auth()).json()["cards"]
+    }
+    hynix = cards["000660"]  # PARTIAL_DATA run + LICENSE_BLOCKED memory_license 행
+    assert hynix["state"] == "partial"
+    assert hynix["has_stale"] is False
+    assert hynix["has_missing"] is True
+    assert hynix.get("has_restricted") is True
+    samsung = cards["005930"]  # STALE_DATA run — stale 이 항상 우선
+    assert samsung["state"] == "stale"
+    assert samsung.get("has_restricted") is True
+
+
+# --- B 리서치 데스크 HTML: 한국어 공개 라벨, coverage 그룹, read-only, 양방향 탐색 ---
+
+_B_COVERAGE_GROUPS = ("핵심 수급", "글로벌 환경", "메모리 지표")
+
+
+@pytest.mark.parametrize("path", ["/ksf", "/ksf/005930", "/ksf/000660"])
+def test_research_desk_html_shows_coverage_groups_and_read_only_posture(
+    client: TestClient, path: str
+):
+    assert client.get(path).status_code == 401  # 인증은 그대로 필수
+    response = client.get(path, headers=_auth())
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    for group in _B_COVERAGE_GROUPS:
+        assert group in response.text, group
+    # read-only 성격이 화면에 명시돼야 한다.
+    assert "읽기 전용" in response.text
+    lowered = response.text.lower()
+    assert "<form" not in lowered
+    assert "<button" not in lowered
+    assert 'method="post"' not in lowered
+    assert not any(word in lowered for word in FORBIDDEN)
+
+
+def test_research_desk_html_uses_korean_state_labels_not_raw_missing(client: TestClient):
+    listing = client.get("/ksf", headers=_auth())
+    assert listing.status_code == 200
+    assert "일부 데이터 준비" in listing.text   # 000660: PARTIAL_DATA primary 상태
+    assert "업데이트 필요" in listing.text      # 005930: stale 우선
+    assert "사용 제한" in listing.text          # secondary qualifier
+    assert "데이터 상태: missing" not in listing.text
+    detail = client.get("/ksf/000660", headers=_auth())
+    assert detail.status_code == 200
+    assert "일부 데이터 준비" in detail.text
+    assert "데이터 상태: missing" not in detail.text
+
+
+def test_research_desk_html_navigates_between_both_symbols(client: TestClient):
+    listing = client.get("/ksf", headers=_auth())
+    assert 'href="/ksf/005930"' in listing.text
+    assert 'href="/ksf/000660"' in listing.text
+    samsung = client.get("/ksf/005930", headers=_auth())
+    assert 'href="/ksf/000660"' in samsung.text
+    assert 'href="/ksf"' in samsung.text
+    hynix = client.get("/ksf/000660", headers=_auth())
+    assert 'href="/ksf/005930"' in hynix.text
+    assert 'href="/ksf"' in hynix.text
+
+
+def test_research_desk_html_distinguishes_ready_pending_restricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """준비됨/수집 대기/사용 제한을 텍스트로 구분한다 — 공백이 앱 오류처럼 보이면 안 된다."""
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="PARTIAL_DATA",
+        features=(
+            ("nvda_adjusted_close", 190.0, "READY"),
+            ("hbm_supply_tightness", None, "LICENSE_BLOCKED"),
+        ),
+    )
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    assert "준비됨" in page.text       # READY 항목
+    assert "수집 대기" in page.text    # 아직 수집되지 않은 항목
+    assert "사용 제한" in page.text    # 차단 항목 — 내부 taxonomy 비노출
+    assert "license_blocked" not in page.text.lower()
+
+
+_HEADLINE_LABEL_CASES = [
+    pytest.param("READY", _READY_FEATURES, "필수 데이터 준비", id="ready-headline"),
+    pytest.param("PARTIAL_DATA", _READY_FEATURES, "일부 데이터 준비", id="partial-headline"),
+    pytest.param("MISSING_REQUIRED_DATA", _READY_FEATURES, "필수 데이터 부족", id="missing-headline"),
+    pytest.param("STALE_DATA", _READY_FEATURES, "업데이트 필요", id="stale-headline"),
+    pytest.param(
+        "READY", _READY_FEATURES + (("hbm_supply_tightness", None, "LICENSE_BLOCKED"),),
+        "사용 제한", id="restricted-headline",
+    ),
+]
+
+
+@pytest.mark.parametrize("run_status,features,label", _HEADLINE_LABEL_CASES)
+def test_research_desk_headline_uses_public_korean_taxonomy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    run_status: str, features: tuple, label: str,
+):
+    client = _state_client(tmp_path, monkeypatch, run_status=run_status, features=features)
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    assert label in page.text
+    # raw 상태 문자열을 headline 으로 노출하지 않는다 (특히 missing).
+    assert "데이터 상태: missing" not in page.text
+
+
+# --- Codex 리뷰 잔여 이슈 회귀 ---------------------------------------------------
+# 블로커 1: 스키마 유효 차단 소스 taxonomy(BLOCKED_REVIEW / quality BLOCKED)는
+#           JSON/HTML 어디에도 원문으로 실리지 않고 UNAVAILABLE 로 일반화된다.
+# 블로커 2: 단위 의미론 — 안전 canonical 단위 allowlist + 보수적 이름 fallback,
+#           미허용/악성 단위 비노출, HTML 단위 라벨/단위 미제공/비유한수 처리.
+# 비차단: KST 변환 표기, href/fragment URL 인코딩, 모바일 overflow 방지 CSS.
+
+
+def _rows_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict],
+) -> TestClient:
+    """빈 원장에 지정한 피처 행들만 넣은 단일 run 클라이언트 (단위/값 회귀용)."""
+    db_path = tmp_path / "rows.sqlite3"
+    _make_ledger(db_path, populated=False)
+    conn = sqlite3.connect(db_path)
+    for index, row in enumerate(rows):
+        _insert_run_feature(
+            conn, run_id="rows-run", symbol="005930",
+            as_of=_STATE_AS_OF, cutoff=_STATE_CUTOFF,
+            feature_id=f"rows-{index}", source_as_of=_STATE_SOURCE_AS_OF,
+            ingested_at=_STATE_INGESTED, **row,
+        )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+# --- 블로커 1: 차단 소스 taxonomy JSON 억제 ---
+
+
+def test_public_status_generalizes_blocked_markers_case_insensitively():
+    from ksf import web_api
+
+    for raw in ("BLOCKED", "BLOCKED_REVIEW", "Blocked_Review", " blocked ", "bLoCkEd_ReViEw"):
+        assert web_api._public_status(raw) == "UNAVAILABLE", raw
+    # 정상 상태/등급은 과차단하지 않는다.
+    assert web_api._public_status("COLLECTED") == "COLLECTED"
+    assert web_api._public_status("CLOSE_CONFIRMED") == "CLOSE_CONFIRMED"
+    assert web_api._public_status("A") == "A"
+    assert web_api._public_status(None) is None
+
+
+def test_schema_valid_blocked_source_is_publicized_as_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """BLOCKED_REVIEW/quality BLOCKED 는 감지(has_restricted)뿐 아니라 직렬화에서도
+    UNAVAILABLE 로 일반화된다."""
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="READY", features=_READY_FEATURES,
+        blocked_source=True,
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality.get("has_restricted") is True
+    assert quality["source_statuses"] == [{
+        "source": "memory_vendor_review",
+        "status": "UNAVAILABLE",
+        "quality": "UNAVAILABLE",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }]
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_blocked_source_taxonomy_absent_from_every_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+):
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="READY", features=_READY_FEATURES,
+        blocked_source=True,
+    )
+    response = client.get(path, headers=_auth())
+    assert response.status_code == 200
+    # BLOCKED / BLOCKED_REVIEW 어느 표기도 (대소문자 무관) 실리면 안 된다.
+    assert "blocked" not in response.text.lower()
+
+
+def test_mixed_case_blocked_source_markers_fail_closed_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "rogue-blocked.sqlite3"
+    _make_state_ledger(db_path, run_status="READY", features=_READY_FEATURES)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    conn.execute(
+        """INSERT INTO ksf_collected_source_metadata
+           (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+           VALUES ('rogue-meta', 'memory_vendor_review', '2026-08-01', 'bLoCkEd', 'NONE')"""
+    )
+    conn.execute(
+        """INSERT INTO ksf_source_snapshots
+           (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+            source_kind, source_status, source_as_of, ingested_at_kst,
+            available_data_cutoff, quality_grade)
+           VALUES ('rogue-snapshot', NULL, '005930', 'rogue-meta',
+                   'memory_vendor_review', 'memory_license_review', 'Blocked_Review',
+                   ?, ?, ?, ' blocked ')""",
+        (_STATE_SOURCE_AS_OF, _STATE_INGESTED, _STATE_CUTOFF),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    client = TestClient(app)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality.get("has_restricted") is True
+    assert quality["source_statuses"] == [{
+        "source": "memory_vendor_review",
+        "status": "UNAVAILABLE",
+        "quality": "UNAVAILABLE",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }]
+    for path in _KSF_ENDPOINTS:
+        response = client.get(path, headers=_auth())
+        assert response.status_code == 200
+        assert "blocked" not in response.text.lower(), path
+
+
+# --- 블로커 2: 단위 의미론 (JSON) ---
+
+
+_UNIT_FALLBACK_CASES = [
+    pytest.param("foreigner_net_buy_quantity", "domestic_flow", "foreign", "shares", id="foreign-qty-shares"),
+    pytest.param("institution_total_net_buy_quantity", "domestic_flow", "institution", "shares", id="institution-qty-shares"),
+    pytest.param("individual_net_buy_quantity", "domestic_flow", "individual", "shares", id="individual-qty-shares"),
+    pytest.param("foreign_net_buy_value", "domestic_flow", "foreign", "KRW", id="net-buy-value-krw"),
+    pytest.param("nvda_adjusted_close", "global_environment", "nvda", "USD", id="nvda-usd"),
+    pytest.param("soxx_close", "global_environment", "soxx", "USD", id="soxx-usd"),
+    pytest.param("mu_close", "memory_indicators", "mu", "USD", id="mu-usd"),
+    pytest.param("tsm_twse_close", "global_environment", "tsm", "TWD", id="tsm-twse-twd"),
+    pytest.param("usdkrw", "global_environment", "usdkrw", "KRW/USD", id="usdkrw-fx"),
+]
+
+
+@pytest.mark.parametrize("feature_name,group,key,expected_unit", _UNIT_FALLBACK_CASES)
+def test_null_ledger_unit_uses_conservative_name_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    feature_name: str, group: str, key: str, expected_unit: str,
+):
+    client = _rows_client(tmp_path, monkeypatch, [{"feature_name": feature_name, "value": 123.0}])
+    item = client.get("/ksf/cards/005930", headers=_auth()).json()[group][key]
+    assert item["value"] == 123.0
+    assert item.get("unit") == expected_unit
+
+
+@pytest.mark.parametrize("feature_name,group,key", [
+    pytest.param("foreign_net_flow", "domestic_flow", "foreign", id="ambiguous-net-flow"),
+    pytest.param("tsm_adjusted_close", "global_environment", "tsm", id="ambiguous-tsm-adr"),
+    pytest.param("dram_price", "memory_indicators", "dram", id="no-guess-dram"),
+    pytest.param("nand_price", "memory_indicators", "nand", id="no-guess-nand"),
+    pytest.param("hbm_supply_tightness", "memory_indicators", "hbm", id="no-guess-hbm"),
+])
+def test_no_unit_is_guessed_for_ambiguous_features(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    feature_name: str, group: str, key: str,
+):
+    client = _rows_client(tmp_path, monkeypatch, [{"feature_name": feature_name, "value": 42.0}])
+    item = client.get("/ksf/cards/005930", headers=_auth()).json()[group][key]
+    assert item["value"] == 42.0
+    assert item.get("unit") is None
+
+
+def test_valid_ledger_unit_is_preferred_and_canonicalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _rows_client(tmp_path, monkeypatch, [
+        # fallback 이 없는 지표에 원장 단위가 있으면 그대로 공개한다.
+        {"feature_name": "dram_price", "value": 2.1, "unit": "USD"},
+        # 원장 단위가 유효하면 이름 fallback(USD)보다 우선한다 + 대소문자/공백 정규화.
+        {"feature_name": "nvda_adjusted_close", "value": 190.0, "unit": " twd "},
+    ])
+    card = client.get("/ksf/cards/005930", headers=_auth()).json()
+    assert card["memory_indicators"]["dram"].get("unit") == "USD"
+    assert card["global_environment"]["nvda"].get("unit") == "TWD"
+
+
+def test_unknown_or_malicious_ledger_unit_never_leaks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _rows_client(tmp_path, monkeypatch, [
+        {"feature_name": "nvda_adjusted_close", "value": 190.0,
+         "unit": '악성단위<script>alert("x")</script>'},
+        {"feature_name": "soxx_adjusted_close", "value": 300.0, "unit": "KRW억"},
+    ])
+    card = client.get("/ksf/cards/005930", headers=_auth()).json()
+    # allowlist 밖 단위는 None — 이름 fallback 으로도 대체하지 않는다(행 자체가 의심).
+    assert card["global_environment"]["nvda"].get("unit") is None
+    assert card["global_environment"]["soxx"].get("unit") is None
+    for path in _KSF_ENDPOINTS:
+        text = client.get(path, headers=_auth()).text.lower()
+        assert "악성단위" not in text, path
+        assert "krw억" not in text, path
+        assert '<script>alert' not in text, path
+
+
+def test_restricted_value_hides_unit_even_with_ledger_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _rows_client(tmp_path, monkeypatch, [
+        {"feature_name": "hbm_supply_tightness", "value": None, "unit": "USD",
+         "status": "LICENSE_BLOCKED", "missing_reason": "license review"},
+    ])
+    hbm = client.get("/ksf/cards/005930", headers=_auth()).json()["memory_indicators"]["hbm"]
+    # 차단 항목은 값뿐 아니라 단위도 노출하지 않는다 (기존 계약 dict 그대로).
+    assert hbm == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }
+
+
+def test_nonfinite_ledger_value_is_null_in_json_and_dash_in_html(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _rows_client(tmp_path, monkeypatch, [
+        {"feature_name": "nvda_adjusted_close", "value": float("inf")},
+    ])
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    nvda = detail.json()["global_environment"]["nvda"]
+    assert nvda["value"] is None
+    assert nvda.get("unit") is None
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    assert "—" in page.text
+    assert "inf" not in page.text.lower()
+
+
+def test_fmt_value_nonfinite_renders_dash():
+    from dashboard.app import _fmt_value
+
+    for value in (float("inf"), float("-inf"), float("nan")):
+        assert _fmt_value(value) == "—"
+        assert _fmt_value(value, signed=True) == "—"
+
+
+# --- 블로커 2: 단위 의미론 (HTML) ---
+
+
+def test_html_renders_safe_unit_labels_and_neutral_domestic_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _rows_client(tmp_path, monkeypatch, [
+        {"feature_name": "foreigner_net_buy_quantity", "value": 1200.0},
+        {"feature_name": "individual_net_buy_quantity", "value": -1500.0},
+        {"feature_name": "nvda_adjusted_close", "value": 190.0},
+        {"feature_name": "tsm_twse_close", "value": 1010.0},
+        {"feature_name": "usdkrw", "value": 1382.5},
+        {"feature_name": "dram_price", "value": 2.1},
+    ])
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    # 국내 수급 라벨은 단위 중립 표기.
+    assert "외국인 순수급" in page.text
+    assert "기관 순수급" in page.text
+    assert "개인 순수급" in page.text
+    assert "순유입" not in page.text
+    # 안전 단위만 명시적 한국어/통화 라벨로 렌더링한다.
+    assert '<span class="unit">주</span>' in page.text
+    assert '<span class="unit">USD</span>' in page.text
+    assert '<span class="unit">TWD</span>' in page.text
+    assert '<span class="unit">원/USD</span>' in page.text
+    # 숫자값인데 안전 단위가 없으면 단위를 암시하지 않고 명시적으로 알린다.
+    assert "단위 미제공" in page.text
+    # 부호/천단위 표기는 유지된다.
+    assert "+1,200" in page.text
+    assert "-1,500" in page.text
+
+
+# --- 비차단 3: KST 시각 표기 ---
+
+
+def test_fmt_ts_converts_mixed_offsets_to_kst_with_single_label():
+    from dashboard.app import _fmt_ts
+
+    assert _fmt_ts("2026-08-01T06:00:00+00:00") == "2026.08.01 15:00 KST"
+    assert _fmt_ts("2026-08-01T18:00:00+09:00") == "2026.08.01 18:00 KST"
+    # 날짜 경계를 넘는 변환도 정확해야 한다.
+    assert _fmt_ts("2026-08-01T23:30:00+00:00") == "2026.08.02 08:30 KST"
+    assert _fmt_ts("2026-08-01T06:00:00+00:00", full=False) == "08.01 15:00 KST"
+
+
+def test_fmt_ts_naive_or_unparseable_is_not_labeled_kst():
+    from dashboard.app import _fmt_ts
+
+    assert _fmt_ts("2026-08-01T15:30:00") == "2026.08.01 15:30"
+    assert _fmt_ts("2026-08-01") == "2026.08.01"
+    assert _fmt_ts("not-a-timestamp") == "not-a-timestamp"
+    assert _fmt_ts(None) == "—"
+    for raw in ("2026-08-01T15:30:00", "2026-08-01", "not-a-timestamp"):
+        assert "KST" not in _fmt_ts(raw), raw
+
+
+def test_metric_source_ts_is_escaped_when_unparseable():
+    from dashboard.app import _metric_html
+
+    out = _metric_html(
+        {"x": {"value": 1.0, "status": "READY", "source_as_of": "<img src=x onerror=y>"}},
+        "x", "라벨", signed=False,
+    )
+    assert "<img" not in out
+    assert "&lt;img" in out
+    assert "KST" not in out
+
+
+def test_detail_page_displays_kst_converted_times_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client = _state_client(tmp_path, monkeypatch, run_status="READY", features=_READY_FEATURES)
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    assert "2026.08.01 18:00 KST" in page.text   # as_of +09:00
+    assert "2026.08.01 16:00 KST" in page.text   # cutoff +09:00
+    assert "2026.08.01 15:00 KST" in page.text   # source 06:00+00:00 → KST 변환
+    assert "08.01 15:00 KST" in page.text        # 메트릭 축약형
+    assert "2026.08.01 06:00" not in page.text   # UTC 시각을 그대로 표기하지 않는다
+    assert "KST KST" not in page.text            # KST 라벨은 시각당 정확히 1회
+
+
+# --- 비차단 4: href/fragment URL 인코딩 ---
+
+
+def test_symbol_href_helper_encodes_adversarial_symbols():
+    from dashboard.app import _symbol_href
+
+    # 지원 심볼은 기존 경로 그대로.
+    assert _symbol_href("005930") == "/ksf/005930"
+    assert _symbol_href("005930", fragment=True) == "#sym-005930"
+    # 속성 컨텍스트를 깨는 문자는 전부 percent 인코딩된다.
+    assert _symbol_href('00"59<b>&30') == "/ksf/00%2259%3Cb%3E%2630"
+    assert _symbol_href("a/b?c#d", fragment=True) == "#sym-a%2Fb%3Fc%23d"
+
+
+def test_symbol_link_attribute_context_is_encoded_and_escaped():
+    from dashboard.app import _symbol_href, _symbol_link
+
+    card = {"symbol": '00"59<b>', "name": '<i>이름</i>"quote'}
+    out = _symbol_link(card, _symbol_href(card["symbol"]))
+    assert 'href="/ksf/00%2259%3Cb%3E"' in out
+    assert "<i>" not in out and "<b>" not in out
+    href_value = out.split('href="', 1)[1].split('"', 1)[0]
+    assert "<" not in href_value and '"' not in href_value
+
+
+# --- 비차단 5: 모바일 overflow 방지 CSS + 긴 무공백 원장 값 escape ---
+
+
+def test_metric_grid_css_prevents_mobile_overflow(client: TestClient):
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    metric_block = re.search(r"\.metric\{[^}]*\}", page.text)
+    assert metric_block is not None
+    assert "min-width:0" in metric_block.group(0)
+    assert "overflow-wrap:anywhere" in metric_block.group(0)
+    card_block = re.search(r"\.card\{[^}]*\}", page.text)
+    assert card_block is not None
+    assert "min-width:0" in card_block.group(0)
+    rec_block = re.search(r"\.rec\{[^}]*\}", page.text)
+    assert rec_block is not None
+    assert "min-width:0" in rec_block.group(0)
+    nav_link_block = re.search(r"nav a\{[^}]*\}", page.text)
+    assert nav_link_block is not None
+    assert "min-height:44px" in nav_link_block.group(0)
+    assert "inline-flex" in nav_link_block.group(0)
+
+
+def test_long_unbroken_markup_ledger_value_is_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payload = "무공백" + "x" * 180 + '<script>alert("주입")</script>' + "y" * 40
+    client = _rows_client(tmp_path, monkeypatch, [
+        {"feature_name": "dram_spot_direction", "value": None, "value_text": payload},
+    ])
+    page = client.get("/ksf/005930", headers=_auth())
+    assert page.status_code == 200
+    assert "<script>alert" not in page.text
+    assert "&lt;script&gt;alert(&quot;주입&quot;)&lt;/script&gt;" in page.text
+    assert "x" * 180 in page.text
+
+
+# --- Codex 재리뷰 블로커: 통합 사설 marker predicate (BLOCKED / BLOCKED_REVIEW) ---
+#
+# 하나의 case-insensitive predicate 가 기존 정책/URL/라이선스 마커에 더해
+# 사설 차단 토큰(BLOCKED, BLOCKED_REVIEW — 정확한 상태값 또는 구분자로 분리된
+# 토큰)을 모든 원장 유래 경로(run_status, feature_status, source name/status/
+# quality, AI 설명)에서 감지해야 한다. "unblocked" 같은 일반 단어에는 절대
+# 반응하지 않는다 (false-positive 대조군).
+
+# 영숫자에 인접하지 않은 "blocked" 토큰 — "unblocked" 는 매칭되지 않는다.
+_DELIMITED_BLOCKED_RE = re.compile(r"(?<![0-9a-z])blocked")
+
+
+def _assert_no_delimited_blocked_token(text: str) -> None:
+    lowered = text.lower()
+    match = _DELIMITED_BLOCKED_RE.search(lowered)
+    assert match is None, f"delimited blocked token leaked: ...{lowered[max(0, match.start() - 40):match.end() + 40]}..."
+
+
+def test_private_marker_predicate_matches_tokens_not_unblocked():
+    from ksf import web_api
+
+    predicate = web_api._has_private_marker
+    # 정확한 상태값 + 대소문자/공백 변형.
+    for raw in ("BLOCKED", "BLOCKED_REVIEW", "blocked", " Blocked_Review ", "bLoCkEd"):
+        assert predicate(raw) is True, raw
+    # 문자열/소스명 내부의 구분자로 분리된 토큰.
+    for raw in (
+        "memory_vendor_blocked_feed",
+        "BLOCKED_REVIEW pending",
+        "차단(BLOCKED) 항목",
+        "quality=blocked;vendor",
+    ):
+        assert predicate(raw) is True, raw
+    # 기존 금지 마커도 같은 predicate 하나로 감지된다.
+    for raw in ("LICENSE_BLOCKED", "Display_Policy", "https://vendor.example", "www.evil.example"):
+        assert predicate(raw) is True, raw
+    # 일반 단어/정상 상태에는 반응하지 않는다.
+    for raw in ("unblocked", "UNBLOCKED", "unblocked_vendor_feed", "READY",
+                "CLOSE_CONFIRMED", "COLLECTED", "A", ""):
+        assert predicate(raw) is False, raw
+    assert predicate(None) is False
+    assert predicate(3.5) is False
+
+
+def test_private_marker_schema_valid_blocked_review_run_is_restricted_and_generalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """스키마 유효 run_status=BLOCKED_REVIEW: 공개 상태는 restricted, run_status 는
+    UNAVAILABLE 로 일반화, has_restricted=true, 결측/신선도 진실은 유지된다."""
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="BLOCKED_REVIEW", features=_READY_FEATURES
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    quality = card["data_quality"]
+    assert quality["state"] == "restricted"
+    assert quality.get("has_restricted") is True
+    assert quality["has_missing"] is False   # READY 피처뿐 — 결측을 지어내지 않는다
+    assert quality["has_stale"] is False
+    assert quality["run_status"] == "UNAVAILABLE"
+    # run 차단은 개별 READY 피처 값을 과억제하지 않는다.
+    assert card["global_environment"]["nvda"]["value"] == 190.0
+    assert card["global_environment"]["nvda"]["status"] == "READY"
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_private_marker_blocked_review_run_absent_from_every_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+):
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="BLOCKED_REVIEW", features=_READY_FEATURES
+    )
+    response = client.get(path, headers=_auth())
+    assert response.status_code == 200
+    _assert_no_delimited_blocked_token(response.text)
+
+
+_RUN_RESTRICTION_PRECEDENCE_CASES = [
+    pytest.param(
+        ("dram_price", 2.0, "STALE"), "stale",
+        id="stale-beats-run-restriction",
+    ),
+    pytest.param(
+        ("institution_net_flow", None, "MISSING_REQUIRED"), "missing",
+        id="required-missing-beats-run-restriction",
+    ),
+    pytest.param(
+        ("dram_price", None, "MISSING_OPTIONAL"), "partial",
+        id="partial-beats-run-restriction",
+    ),
+]
+
+
+@pytest.mark.parametrize("extra_feature,expected_state", _RUN_RESTRICTION_PRECEDENCE_CASES)
+def test_private_marker_run_restriction_yields_to_state_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    extra_feature: tuple, expected_state: str,
+):
+    """restricted 는 stale/필수 결측/partial 보다 후순위 — has_restricted 는 그대로 참."""
+    client = _state_client(
+        tmp_path, monkeypatch, run_status="BLOCKED_REVIEW",
+        features=_READY_FEATURES + (extra_feature,),
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality["state"] == expected_state
+    assert quality.get("has_restricted") is True
+    assert quality["run_status"] == "UNAVAILABLE"
+
+
+def _rogue_blocked_feature_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: str,
+) -> TestClient:
+    """스키마 CHECK 를 우회해 rogue 차단 feature_status(+살아있는 값/단위)를 주입한다."""
+    db_path = tmp_path / "rogue-blocked-feature.sqlite3"
+    _make_state_ledger(db_path, run_status="READY", features=_READY_FEATURES)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    _insert_run_feature(
+        conn, run_id="state-run", symbol="005930",
+        as_of=_STATE_AS_OF, cutoff=_STATE_CUTOFF,
+        feature_id="rogue-blocked-hbm", feature_name="hbm_supply_tightness",
+        value=4321.75, source_as_of=_STATE_SOURCE_AS_OF, ingested_at=_STATE_INGESTED,
+        status=status, unit="USD",
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("status", ["BLOCKED", "BLOCKED_REVIEW", "bLoCkEd", "Blocked_Review"])
+def test_private_marker_rogue_blocked_feature_suppresses_value_and_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+):
+    """rogue/대소문자 변형 차단 feature_status: 값·단위 전부 억제 + UNAVAILABLE 일반화 +
+    has_restricted 참 + 억제된 항목의 has_missing 진실 유지."""
+    client = _rogue_blocked_feature_client(tmp_path, monkeypatch, status=status)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    # 단위 키까지 포함해 완전 일치 — 값/단위가 어떤 형태로도 노출되면 안 된다.
+    assert card["memory_indicators"]["hbm"] == {
+        "value": None,
+        "status": "UNAVAILABLE",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }
+    quality = card["data_quality"]
+    assert quality.get("has_restricted") is True
+    # 값이 억제된 차단 항목은 공개 화면 기준으로 결측이 맞다 — 거짓 ready 금지.
+    assert quality["has_missing"] is True
+    assert quality["state"] == "restricted"
+    assert "4321.75" not in detail.text
+    _assert_no_delimited_blocked_token(detail.text)
+
+
+@pytest.mark.parametrize("path", _KSF_ENDPOINTS)
+def test_private_marker_rogue_blocked_feature_absent_from_every_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+):
+    client = _rogue_blocked_feature_client(tmp_path, monkeypatch, status="bLoCkEd_ReViEw")
+    response = client.get(path, headers=_auth())
+    assert response.status_code == 200
+    assert "4321.75" not in response.text
+    _assert_no_delimited_blocked_token(response.text)
+
+
+def _named_source_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_name: str,
+    quality_grade: str = "B",
+) -> TestClient:
+    """스키마 유효(CLOSE_CONFIRMED) 소스 스냅샷을 임의 source_name 으로 주입한다."""
+    db_path = tmp_path / "named-source.sqlite3"
+    _make_state_ledger(db_path, run_status="READY", features=_READY_FEATURES)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO ksf_collected_source_metadata
+           (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+           VALUES ('named-meta', ?, '2026-08-01', ?, 'NONE')""",
+        (source_name, quality_grade),
+    )
+    conn.execute(
+        """INSERT INTO ksf_source_snapshots
+           (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+            source_kind, source_status, source_as_of, ingested_at_kst,
+            available_data_cutoff, quality_grade)
+           VALUES ('named-snapshot', NULL, '005930', 'named-meta', ?,
+                   'memory_license_review', 'CLOSE_CONFIRMED', ?, ?, ?, ?)""",
+        (source_name, _STATE_SOURCE_AS_OF, _STATE_INGESTED, _STATE_CUTOFF, quality_grade),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    return TestClient(app)
+
+
+def test_private_marker_delimited_blocked_source_name_masked_and_restricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """구분자로 분리된 blocked 토큰을 담은 source_name 은 기존 일반 라벨로 대체되고
+    has_restricted 에 포함된다. 행 자체(상태/품질/시각)는 보존한다."""
+    client = _named_source_client(
+        tmp_path, monkeypatch, source_name="memory_vendor_blocked_feed"
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality["source_statuses"] == [{
+        "source": "restricted_source",
+        "status": "CLOSE_CONFIRMED",
+        "quality": "B",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }]
+    assert quality.get("has_restricted") is True
+    assert quality["state"] == "restricted"
+    assert "memory_vendor_blocked_feed" not in detail.text
+    for path in _KSF_ENDPOINTS:
+        response = client.get(path, headers=_auth())
+        assert response.status_code == 200
+        _assert_no_delimited_blocked_token(response.text)
+
+
+def test_private_marker_unblocked_source_name_stays_public_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """false-positive 대조군: "unblocked" 를 담은 정상 source_name 은 그대로 공개되고
+    단독으로는 어떤 제한도 유발하지 않는다."""
+    client = _named_source_client(
+        tmp_path, monkeypatch, source_name="unblocked_vendor_feed", quality_grade="A"
+    )
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality["source_statuses"] == [{
+        "source": "unblocked_vendor_feed",
+        "status": "CLOSE_CONFIRMED",
+        "quality": "A",
+        "source_as_of": _STATE_SOURCE_AS_OF,
+    }]
+    assert quality.get("has_restricted") is False
+    assert quality["state"] == "ready"
+
+
+_PM_SAFE_DRIVER = "외국인 수급 우호적"
+_PM_SAFE_RISK = "메모리 지표 변동성 확대"
+_PM_UNBLOCKED_RISK = "unblocked 지표는 정상 반영"
+_PM_BLOCKED_DRIVERS = [
+    _PM_SAFE_DRIVER,
+    "BLOCKED_REVIEW 대기 항목 제외",
+    "vendor_blocked 소스 제외",
+]
+_PM_BLOCKED_RISKS = [
+    _PM_SAFE_RISK,
+    "차단(BLOCKED) 데이터 미반영",
+    _PM_UNBLOCKED_RISK,
+]
+
+
+def _insert_state_ai_explanations(db_path: Path, drivers: list[str], risks: list[str]) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO ksf_ai_requests
+           (ai_request_id, run_id, symbol, purpose, as_of_kst,
+            available_data_cutoff, prompt_template_version,
+            redaction_policy_version, input_ledger_hash_sha256,
+            prompt_hash_sha256, model_provider, model_name)
+           VALUES ('pm-request', 'state-run', '005930', 'explain_decision',
+                   ?, ?, 'v1', 'v1', 'pm-input', 'pm-prompt', 'offline', 'fixture')""",
+        (_STATE_AS_OF, _STATE_CUTOFF),
+    )
+    conn.execute(
+        """INSERT INTO ksf_ai_responses
+           (ai_response_id, ai_request_id, run_id, symbol, response_status,
+            response_hash_sha256, summary, drivers_json, risks_json,
+            model_provider, model_name)
+           VALUES ('pm-response', 'pm-request', 'state-run', '005930', 'OK',
+                   'pm-hash', '단일 종목 흐름 요약', ?, ?, 'offline', 'fixture')""",
+        (json.dumps(drivers, ensure_ascii=False), json.dumps(risks, ensure_ascii=False)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_private_marker_ai_explanations_dropped_and_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """차단 토큰을 담은 AI driver/risk 문자열은 통째로 폐기되고 has_restricted 를
+    참으로 만든다. "unblocked" 대조군 문자열은 살아남는다."""
+    db_path = tmp_path / "pm-ai.sqlite3"
+    _make_state_ledger(db_path, run_status="READY", features=_READY_FEATURES)
+    _insert_state_ai_explanations(db_path, _PM_BLOCKED_DRIVERS, _PM_BLOCKED_RISKS)
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    client = TestClient(app)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    card = detail.json()
+    assert card["evidence"] == [_PM_SAFE_DRIVER]
+    assert card["counterarguments"] == [_PM_SAFE_RISK, _PM_UNBLOCKED_RISK]
+    assert card["data_quality"].get("has_restricted") is True
+    assert card["data_quality"]["state"] == "restricted"
+    for path in _KSF_ENDPOINTS:
+        response = client.get(path, headers=_auth())
+        assert response.status_code == 200
+        _assert_no_delimited_blocked_token(response.text)
+        assert "vendor_blocked" not in response.text.lower()
+
+
+def test_private_marker_combined_adversarial_ledger_leaks_nothing_anywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """총력전: BLOCKED_REVIEW run + rogue 차단 피처 + blocked 토큰 소스명 + 차단 AI 설명
+    + unblocked 대조군 소스를 한 원장에 모두 넣어도 4개 엔드포인트 어디에도 구분된
+    blocked 토큰이 없고, 대조군은 과차단되지 않는다."""
+    db_path = tmp_path / "pm-combined.sqlite3"
+    _make_state_ledger(db_path, run_status="BLOCKED_REVIEW", features=_READY_FEATURES)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    _insert_run_feature(
+        conn, run_id="state-run", symbol="005930",
+        as_of=_STATE_AS_OF, cutoff=_STATE_CUTOFF,
+        feature_id="pm-rogue-hbm", feature_name="hbm_supply_tightness",
+        value=4321.75, source_as_of=_STATE_SOURCE_AS_OF, ingested_at=_STATE_INGESTED,
+        status="Blocked_Review", unit="USD",
+    )
+    for suffix, source_name, grade in (
+        ("masked", "memory_vendor_blocked_feed", "B"),
+        ("control", "unblocked_vendor_feed", "A"),
+    ):
+        conn.execute(
+            """INSERT INTO ksf_collected_source_metadata
+               (metadata_id, source_name, capture_date, quality_grade, raw_storage_policy)
+               VALUES (?, ?, '2026-08-01', ?, 'NONE')""",
+            (f"pm-meta-{suffix}", source_name, grade),
+        )
+        conn.execute(
+            """INSERT INTO ksf_source_snapshots
+               (snapshot_id, run_id, symbol, source_metadata_id, source_name,
+                source_kind, source_status, source_as_of, ingested_at_kst,
+                available_data_cutoff, quality_grade)
+               VALUES (?, NULL, '005930', ?, ?, 'memory_license_review',
+                       'CLOSE_CONFIRMED', ?, ?, ?, ?)""",
+            (f"pm-snapshot-{suffix}", f"pm-meta-{suffix}", source_name,
+             _STATE_SOURCE_AS_OF, _STATE_INGESTED, _STATE_CUTOFF, grade),
+        )
+    conn.commit()
+    conn.close()
+    _insert_state_ai_explanations(db_path, _PM_BLOCKED_DRIVERS, _PM_BLOCKED_RISKS)
+    monkeypatch.setenv("KSF_LEDGER_DB_PATH", str(db_path))
+    monkeypatch.setenv("KSF_READ_TOKEN", AUTH_VALUE)
+    monkeypatch.delenv("KSF_READ_USERNAME", raising=False)
+    monkeypatch.delenv("KSF_READ_PASSWORD", raising=False)
+    client = TestClient(app)
+    detail = client.get("/ksf/cards/005930", headers=_auth())
+    assert detail.status_code == 200
+    quality = detail.json()["data_quality"]
+    assert quality.get("has_restricted") is True
+    assert quality["state"] == "restricted"
+    assert quality["run_status"] == "UNAVAILABLE"
+    for path in _KSF_ENDPOINTS:
+        response = client.get(path, headers=_auth())
+        assert response.status_code == 200
+        _assert_no_delimited_blocked_token(response.text)
+        assert "4321.75" not in response.text
+        if path.startswith("/ksf/cards"):
+            # 대조군 소스명은 과차단되지 않는다 (source_statuses 는 JSON 에만 실린다).
+            assert "unblocked_vendor_feed" in response.text
