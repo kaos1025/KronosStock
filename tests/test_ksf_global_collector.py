@@ -1,10 +1,17 @@
+import json
+import re
 import sqlite3
+import urllib.parse
+from pathlib import Path
 
 import pytest
 
 from ksf.global_collector import (
+    ALPHA_VANTAGE_URL,
     NormalizedFeature,
+    RequestPacer,
     SourceSnapshot,
+    collect_global_inputs,
     collect_global_inputs_for_symbol,
     ensure_run,
     init_ledger_schema,
@@ -14,6 +21,9 @@ from ksf.global_collector import (
     offline_fixture,
     run_smoke,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+SECRET_ALPHA_KEY = "SECRET-ALPHA-KEY-123"
 
 
 def memory_conn():
@@ -317,3 +327,306 @@ def test_no_secret_offline_smoke_uses_temp_sqlite():
     assert smoke["integrity_check"] == "ok"
     assert smoke["counts"]["ksf_source_snapshots"] == 7
     assert smoke["live_readonly"] is False
+
+
+# --- Task 1: Alpha Vantage readiness and safe collection ---
+
+
+def fixtures_without_alpha():
+    fixtures = offline_fixture()
+    fixtures.pop("alpha_vantage")
+    return fixtures
+
+
+def live_alpha_http(calls):
+    """Offline stand-in for the documented read-only Alpha Vantage endpoint."""
+    payloads = offline_fixture()["alpha_vantage"]
+
+    def _get(url, headers=None):
+        calls.append(url)
+        parts = urllib.parse.urlsplit(url)
+        assert f"{parts.scheme}://{parts.netloc}{parts.path}" == ALPHA_VANTAGE_URL
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        assert query["function"] == "TIME_SERIES_DAILY_ADJUSTED"
+        assert query["outputsize"] == "compact"
+        assert query["apikey"] == SECRET_ALPHA_KEY
+        return 200, json.dumps(payloads[query["symbol"]])
+
+    return _get
+
+
+def db_dump(conn):
+    return "\n".join(conn.iterdump())
+
+
+def test_configured_key_uses_documented_readonly_path_without_leaking_secret(capsys):
+    conn = memory_conn()
+    calls = []
+    result = collect_once(
+        conn,
+        fixtures=fixtures_without_alpha(),
+        http_get=live_alpha_http(calls),
+        alpha_vantage_key=SECRET_ALPHA_KEY,
+    )
+
+    requested = sorted(
+        dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["symbol"] for url in calls
+    )
+    assert requested == ["MU", "NVDA", "SOXX"]
+    ready = dict(
+        conn.execute(
+            """SELECT feature_name, value_num FROM ksf_normalized_features
+               WHERE feature_name IN ('mu_adjusted_close','nvda_adjusted_close','soxx_adjusted_close')"""
+        ).fetchall()
+    )
+    # 2026-07-31 US rows are unavailable at the 16:00 KST cutoff → latest usable rows.
+    assert ready == {"mu_adjusted_close": 100.0, "nvda_adjusted_close": 175.0, "soxx_adjusted_close": 250.0}
+
+    dump = db_dump(conn)
+    captured = capsys.readouterr()
+    assert SECRET_ALPHA_KEY not in dump
+    assert SECRET_ALPHA_KEY not in captured.out + captured.err
+    assert SECRET_ALPHA_KEY not in repr(result)
+    # Only the documented placeholder template may mention apikey — never a real value.
+    assert "apikey=" not in dump.replace("apikey=$ALPHAVANTAGE_API_KEY", "")
+
+
+def test_vendor_note_and_information_become_rate_limited_without_raw_text_or_zero():
+    conn = memory_conn()
+    fixtures = offline_fixture()
+    fixtures["alpha_vantage"] = {
+        "MU": {"Note": "Thank you for using Alpha Vantage! Our standard API rate limit is 25 requests per day."},
+        "NVDA": {"Information": "This is a premium endpoint notice."},
+        "SOXX": fixtures["alpha_vantage"]["SOXX"],
+    }
+    collect_once(conn, fixtures=fixtures)
+
+    rows = conn.execute(
+        """SELECT source_status, missing_reason, snapshot_metadata_json FROM ksf_source_snapshots
+           WHERE source_name='alpha_vantage_daily_adjusted'
+             AND snapshot_metadata_json LIKE '%VENDOR_RATE_LIMIT_NOTICE%'"""
+    ).fetchall()
+    assert len(rows) == 2
+    for status, reason, metadata in rows:
+        assert status == "MISSING"
+        assert "rate" in reason.lower()
+        assert '"quality_label":"RATE_LIMITED"' in metadata
+
+    features = conn.execute(
+        """SELECT feature_name, feature_status, value_num FROM ksf_normalized_features
+           WHERE feature_name LIKE 'mu_%' OR feature_name LIKE 'nvda_%'"""
+    ).fetchall()
+    assert len(features) == 6
+    assert all(status == "MISSING_OPTIONAL" and value is None for _, status, value in features)
+
+    dump = db_dump(conn)
+    assert "25 requests per day" not in dump
+    assert "premium endpoint" not in dump
+
+
+def test_vendor_error_message_fails_closed_without_persisting_raw_message():
+    conn = memory_conn()
+    fixtures = offline_fixture()
+    fixtures["alpha_vantage"]["MU"] = {"Error Message": "Invalid API call. SECRET-ECHO-VALUE"}
+    collect_once(conn, fixtures=fixtures)
+
+    row = conn.execute(
+        """SELECT source_status, missing_reason FROM ksf_source_snapshots
+           WHERE source_name='alpha_vantage_daily_adjusted'
+             AND snapshot_metadata_json LIKE '%VENDOR_ERROR_MESSAGE%'"""
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "MISSING"
+    assert "not persisted" in row[1]
+
+    mu = conn.execute(
+        "SELECT feature_status, value_num FROM ksf_normalized_features WHERE feature_name LIKE 'mu_%'"
+    ).fetchall()
+    assert len(mu) == 3
+    assert all(status == "MISSING_OPTIONAL" and value is None for status, value in mu)
+    assert "SECRET-ECHO-VALUE" not in db_dump(conn)
+
+
+def test_http_429_is_explicit_rate_limited_for_all_peers():
+    conn = memory_conn()
+
+    def throttled(url, headers=None):
+        return 429, "Too Many Requests"
+
+    result = collect_once(
+        conn,
+        fixtures=fixtures_without_alpha(),
+        http_get=throttled,
+        alpha_vantage_key=SECRET_ALPHA_KEY,
+    )
+
+    assert result.statuses["alpha_vantage_daily_adjusted"] == "MISSING"
+    count = conn.execute(
+        "SELECT COUNT(*) FROM ksf_source_snapshots WHERE snapshot_metadata_json LIKE '%HTTP_429_RATE_LIMIT%'"
+    ).fetchone()[0]
+    assert count == 3
+    features = conn.execute(
+        """SELECT feature_status, value_num FROM ksf_normalized_features
+           WHERE feature_name LIKE 'mu_%' OR feature_name LIKE 'nvda_%' OR feature_name LIKE 'soxx_%'"""
+    ).fetchall()
+    assert len(features) == 9
+    assert all(status == "MISSING_OPTIONAL" and value is None for status, value in features)
+    assert SECRET_ALPHA_KEY not in db_dump(conn)
+
+
+def test_live_alpha_requests_are_paced_with_bounded_fixed_interval():
+    conn = memory_conn()
+    sleeps = []
+    calls = []
+    collect_once(
+        conn,
+        fixtures=fixtures_without_alpha(),
+        http_get=live_alpha_http(calls),
+        alpha_vantage_key=SECRET_ALPHA_KEY,
+        pacer=RequestPacer(sleep=sleeps.append),
+    )
+
+    assert len(calls) == 3
+    # First request is immediate; every following live request waits one fixed bounded interval.
+    assert len(sleeps) == 2
+    assert len(set(sleeps)) == 1
+    assert all(0 < interval <= 60 for interval in sleeps)
+
+
+def test_collect_global_inputs_fetches_each_peer_once_and_reuses_for_all_symbols(monkeypatch):
+    conn = memory_conn()
+    monkeypatch.setenv("ALPHAVANTAGE_API_KEY", SECRET_ALPHA_KEY)
+    monkeypatch.delenv("BOK_ECOS_KEY", raising=False)
+    sleeps = []
+    calls = []
+
+    results = collect_global_inputs(
+        conn,
+        symbols=("005930", "000660"),
+        trading_date="2026-07-31",
+        as_of_kst="2026-07-31T16:10:00+09:00",
+        available_data_cutoff="2026-07-31T16:00:00+09:00",
+        fixtures=fixtures_without_alpha(),
+        http_get=live_alpha_http(calls),
+        pacer=RequestPacer(sleep=sleeps.append),
+    )
+
+    assert set(results) == {"005930", "000660"}
+    # Alpha peers are global snapshots: one fetch per peer per run, reused across symbols.
+    requested = sorted(
+        dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["symbol"] for url in calls
+    )
+    assert requested == ["MU", "NVDA", "SOXX"]
+    assert len(sleeps) == 2
+    assert all(0 < interval <= 60 for interval in sleeps)
+
+    # Both domestic symbols keep their own full feature lineage from the shared snapshots.
+    # (SOXX fixture row is 6 days old → labeled STALE by design; the value is still recorded.)
+    rows = conn.execute(
+        """SELECT symbol, feature_name, feature_status, value_num FROM ksf_normalized_features
+           WHERE feature_name IN ('mu_adjusted_close','nvda_adjusted_close','soxx_adjusted_close')"""
+    ).fetchall()
+    assert len(rows) == 6
+    assert {status for _, _, status, _ in rows} == {"READY", "STALE"}
+    for symbol in ("005930", "000660"):
+        values = {name: value for sym, name, _, value in rows if sym == symbol}
+        assert values == {"mu_adjusted_close": 100.0, "nvda_adjusted_close": 175.0, "soxx_adjusted_close": 250.0}
+    assert SECRET_ALPHA_KEY not in db_dump(conn)
+
+
+def test_offline_fixture_and_missing_key_paths_never_sleep():
+    sleeps = []
+    collect_once(memory_conn(), pacer=RequestPacer(sleep=sleeps.append))
+    assert sleeps == []
+
+    def no_network(url, headers=None):
+        raise AssertionError("network must not be called")
+
+    collect_once(
+        memory_conn(),
+        fixtures=fixtures_without_alpha(),
+        http_get=no_network,
+        pacer=RequestPacer(sleep=sleeps.append),
+    )
+    assert sleeps == []
+
+
+def test_future_dated_only_rows_fail_closed_as_explicit_missing():
+    conn = memory_conn()
+    fixtures = offline_fixture()
+    fixtures["alpha_vantage"]["MU"] = {
+        "Time Series (Daily)": {
+            "2026-08-03": {"4. close": "111.00", "5. adjusted close": "111.00", "6. volume": "1"}
+        }
+    }
+    collect_once(conn, fixtures=fixtures)
+
+    row = conn.execute(
+        """SELECT source_status, missing_reason FROM ksf_source_snapshots
+           WHERE source_name='alpha_vantage_daily_adjusted'
+             AND snapshot_metadata_json LIKE '%NO_OBSERVATION_AT_OR_BEFORE_CUTOFF%'"""
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "MISSING"
+    assert "cutoff" in row[1]
+
+    mu = conn.execute(
+        "SELECT feature_status, value_num FROM ksf_normalized_features WHERE feature_name LIKE 'mu_%'"
+    ).fetchall()
+    assert len(mu) == 3
+    assert all(status == "MISSING_OPTIONAL" and value is None for status, value in mu)
+
+
+def test_generic_http_or_schema_failure_yields_all_three_peer_features_missing():
+    conn = memory_conn()
+
+    def broken(url, headers=None):
+        return 200, "this is not json {"
+
+    collect_once(
+        conn,
+        fixtures=fixtures_without_alpha(),
+        http_get=broken,
+        alpha_vantage_key=SECRET_ALPHA_KEY,
+    )
+
+    for peer in ("mu", "nvda", "soxx"):
+        rows = conn.execute(
+            "SELECT feature_name, feature_status, value_num FROM ksf_normalized_features WHERE feature_name LIKE ?",
+            (f"{peer}_%",),
+        ).fetchall()
+        assert sorted(name for name, _, _ in rows) == [
+            f"{peer}_adjusted_close",
+            f"{peer}_one_day_return_bps",
+            f"{peer}_volume",
+        ]
+        assert all(status == "MISSING_OPTIONAL" and value is None for _, status, value in rows)
+    assert SECRET_ALPHA_KEY not in db_dump(conn)
+
+
+def test_rate_limited_persistence_is_idempotent():
+    conn = memory_conn()
+    fixtures = offline_fixture()
+    fixtures["alpha_vantage"]["MU"] = {"Note": "throttled"}
+    first = collect_once(conn, fixtures=fixtures)
+    second = collect_once(conn, fixtures=fixtures)
+
+    assert first.snapshots_inserted == 7
+    assert first.features_inserted > 0
+    assert second.snapshots_inserted == 0
+    assert second.features_inserted == 0
+
+
+def test_env_example_documents_alpha_vantage_production_config_without_value():
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "Alpha Vantage" in text
+    # Documented as production config, never with an embedded secret value.
+    assert re.search(r"^ALPHAVANTAGE_API_KEY=$", text, re.MULTILINE)
+
+
+def test_settings_expose_alpha_vantage_readiness_without_requiring_secret(monkeypatch):
+    monkeypatch.delenv("ALPHAVANTAGE_API_KEY", raising=False)
+    from common.config import Settings
+
+    assert Settings(_env_file=None).alphavantage_configured is False
+    assert Settings(_env_file=None, alphavantage_api_key="k").alphavantage_configured is True

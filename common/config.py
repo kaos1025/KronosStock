@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     tossinvest_base_url: str = "https://openapi.tossinvest.com"
     tossinvest_timeout: float = 10.0
 
+    # ── Alpha Vantage — KSF 글로벌 반도체 피어(NVDA/SOXX/MU) read-only 일봉 (선택) ──
+    # 비어 있으면 수집기는 네트워크 호출 없이 MISSING_OPTIONAL 로 fail-closed 기록한다.
+    alphavantage_api_key: str = ""
+
     # ── Redis (KronosKit 과 인스턴스 공유 가능 → 키 prefix 로 네임스페이스 분리) ──
     redis_url: str = "redis://localhost:6379/0"
     redis_password: str = ""
@@ -112,6 +116,11 @@ class Settings(BaseSettings):
     def tossinvest_configured(self) -> bool:
         """토스증권 Open API client credentials 설정 여부."""
         return bool(self.tossinvest_client_id and self.tossinvest_client_secret)
+
+    @property
+    def alphavantage_configured(self) -> bool:
+        """Alpha Vantage 글로벌 피어 수집 활성 여부(없으면 수집기가 MISSING_OPTIONAL 처리)."""
+        return bool(self.alphavantage_api_key)
 
     @property
     def telegram_configured(self) -> bool:

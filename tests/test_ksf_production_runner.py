@@ -254,6 +254,23 @@ def test_domestic_price_failure_is_hard_and_does_not_leak_secret(tmp_path, capsy
     assert json.loads(output) == {"status": "failed", "failed_stage": "domestic_price"}
 
 
+def test_global_failure_is_hard_and_does_not_leak_secret(tmp_path, capsys):
+    from ksf.production_runner import RunnerDependencies, main
+
+    secret = "TOP-SECRET-ALPHA-KEY"
+
+    def fail_global(*args, **kwargs):
+        raise RuntimeError(f"global failed with {secret}")
+
+    deps = RunnerDependencies(domestic=fake_domestic, domestic_price=fake_price, global_collect=fail_global, now=lambda: AS_OF)
+    rc = main(["--db", str(tmp_path / "ledger.sqlite3")], dependencies=deps)
+    output = capsys.readouterr().out
+
+    assert rc != 0
+    assert secret not in output
+    assert json.loads(output) == {"status": "failed", "failed_stage": "global"}
+
+
 def test_feature_gate_fails_when_supported_symbol_has_missing_or_stale_required(tmp_path, capsys):
     from ksf.production_runner import RunnerDependencies, main
 

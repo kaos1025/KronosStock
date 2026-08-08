@@ -16,6 +16,7 @@ import math
 import os
 import socket
 import sqlite3
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,9 +40,36 @@ FRED_DEXKOUS_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXKOUS"
 MEMORY_LICENSE_URL = "https://www.trendforce.com/price/dram/dram_spot"
 MEMORY_TERMS_URL = "https://www.dramexchange.com/About/TermsOfUse"
 USER_AGENT = "KronosStock-KSF-Collector/0.1 read-only contact=kaos1025"
+# Alpha Vantage free tier is heavily throttled (historically 5 req/min); one fixed
+# bounded interval between consecutive live requests keeps the daily run inside it.
+ALPHA_VANTAGE_REQUEST_PACING_SECONDS = 15.0
+ALPHA_VANTAGE_RATE_LIMIT_NOTICE_KEYS = ("Note", "Information")
+ALPHA_VANTAGE_ERROR_KEY = "Error Message"
 
 HttpGet = Callable[[str, Mapping[str, str] | None], tuple[int, str]]
 ENV_KEY = object()
+
+
+class RequestPacer:
+    """Fixed-interval pacing between consecutive live vendor requests.
+
+    Deterministic by construction: no wall-clock reads, only an injected sleep,
+    so offline tests can record intervals instead of waiting.
+    """
+
+    def __init__(
+        self,
+        interval_seconds: float = ALPHA_VANTAGE_REQUEST_PACING_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.interval_seconds = interval_seconds
+        self._sleep = sleep
+        self._paced_calls = 0
+
+    def pace(self) -> None:
+        if self._paced_calls:
+            self._sleep(self.interval_seconds)
+        self._paced_calls += 1
 
 
 @dataclass(frozen=True)
@@ -470,6 +498,44 @@ def parse_alpha_vantage_daily(payload: Mapping[str, Any], cutoff: str) -> dict[s
     }
 
 
+def _alpha_vantage_unavailable(
+    peer_symbol: str,
+    *,
+    cutoff: str,
+    ingested_at_kst: str,
+    missing_reason: str,
+    quality_label: str,
+    vendor_notice_class: str,
+) -> tuple[SourceSnapshot, list[dict[str, Any]]]:
+    """Explicit fail-closed result: no values are fabricated, no raw vendor text kept."""
+    snapshot = SourceSnapshot(
+        None,
+        None,
+        "alpha_vantage_daily_adjusted",
+        "global_price",
+        "MISSING",
+        cutoff[:10],
+        ingested_at_kst,
+        cutoff,
+        "B",
+        0,
+        missing_reason,
+        normalized_payload_sha256=sha256_text(f"alpha-unavailable-{peer_symbol}-{vendor_notice_class}-{cutoff}"),
+        snapshot_metadata={
+            "peer_symbol": peer_symbol,
+            "market_timezone": "America/New_York",
+            "holiday_calendar": "XNYS",
+            "quality_label": quality_label,
+            "vendor_notice_class": vendor_notice_class,
+        },
+    )
+    features = [
+        {"name": f"{peer_symbol.lower()}_{suffix}", "status": "MISSING_OPTIONAL", "missing_reason": missing_reason}
+        for suffix in ("adjusted_close", "volume", "one_day_return_bps")
+    ]
+    return snapshot, features
+
+
 def collect_alpha_vantage_peer(
     peer_symbol: str,
     *,
@@ -478,6 +544,7 @@ def collect_alpha_vantage_peer(
     http_get: HttpGet,
     api_key: str | None,
     fixture_payload: Mapping[str, Any] | None = None,
+    pacer: RequestPacer | None = None,
 ) -> tuple[SourceSnapshot, list[dict[str, Any]]]:
     if not api_key and fixture_payload is None:
         source_as_of = cutoff[:10]
@@ -505,13 +572,56 @@ def collect_alpha_vantage_peer(
     if fixture_payload is not None:
         payload = fixture_payload
     else:
+        if pacer is not None:
+            pacer.pace()
         status, body = http_get(alpha_vantage_url(peer_symbol, api_key or ""), None)
+        if status == 429:
+            return _alpha_vantage_unavailable(
+                peer_symbol,
+                cutoff=cutoff,
+                ingested_at_kst=ingested_at_kst,
+                missing_reason=f"Alpha Vantage {peer_symbol} returned HTTP 429 rate limit; values are not fabricated",
+                quality_label="RATE_LIMITED",
+                vendor_notice_class="HTTP_429_RATE_LIMIT",
+            )
         if status != 200:
             raise RuntimeError(f"Alpha Vantage {peer_symbol} returned HTTP {status}")
         payload = json.loads(body)
+    if isinstance(payload, Mapping):
+        if ALPHA_VANTAGE_ERROR_KEY in payload:
+            return _alpha_vantage_unavailable(
+                peer_symbol,
+                cutoff=cutoff,
+                ingested_at_kst=ingested_at_kst,
+                missing_reason=f"Alpha Vantage {peer_symbol} vendor error response; raw vendor message not persisted",
+                quality_label="MISSING",
+                vendor_notice_class="VENDOR_ERROR_MESSAGE",
+            )
+        if any(key in payload for key in ALPHA_VANTAGE_RATE_LIMIT_NOTICE_KEYS):
+            return _alpha_vantage_unavailable(
+                peer_symbol,
+                cutoff=cutoff,
+                ingested_at_kst=ingested_at_kst,
+                missing_reason=(
+                    f"Alpha Vantage {peer_symbol} rate-limit/usage notice; values are not fabricated; "
+                    "raw vendor message not persisted"
+                ),
+                quality_label="RATE_LIMITED",
+                vendor_notice_class="VENDOR_RATE_LIMIT_NOTICE",
+            )
     row = parse_alpha_vantage_daily(payload, cutoff)
     if not row:
-        raise RuntimeError(f"Alpha Vantage {peer_symbol} has no daily row before cutoff")
+        return _alpha_vantage_unavailable(
+            peer_symbol,
+            cutoff=cutoff,
+            ingested_at_kst=ingested_at_kst,
+            missing_reason=(
+                f"Alpha Vantage {peer_symbol} has no observation at or before the cutoff; "
+                "future-dated rows fail closed"
+            ),
+            quality_label="MISSING",
+            vendor_notice_class="NO_OBSERVATION_AT_OR_BEFORE_CUTOFF",
+        )
     lag = days_lag(row["source_as_of"], cutoff)
     source_status = status_for_lag(lag, stale_after_days=5)
     normalized_hash = sha256_text(stable_json({"peer_symbol": peer_symbol, **row}))
@@ -788,6 +898,51 @@ def _is_missing_feature_value(value: Any) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
+def collect_alpha_peer_results(
+    *,
+    cutoff: str,
+    http_get: HttpGet,
+    api_key: str | None,
+    alpha_fixtures: Mapping[str, Any],
+    pacer: RequestPacer,
+) -> dict[str, tuple[SourceSnapshot, list[dict[str, Any]]]]:
+    """Alpha 피어는 심볼과 무관한 글로벌 스냅샷 — run 당 1회만 수집해 심볼별 lineage 에 재사용한다."""
+    results: dict[str, tuple[SourceSnapshot, list[dict[str, Any]]]] = {}
+    for peer in GLOBAL_PEERS:
+        try:
+            results[peer] = collect_alpha_vantage_peer(
+                peer,
+                cutoff=cutoff,
+                ingested_at_kst=cutoff,
+                http_get=http_get,
+                api_key=api_key,
+                fixture_payload=alpha_fixtures.get(peer),
+                pacer=pacer,
+            )
+        except Exception as exc:  # network/schema fallback is represented in ledger, not raised
+            snap = SourceSnapshot(
+                None,
+                None,
+                "alpha_vantage_daily_adjusted",
+                "global_price",
+                "MISSING",
+                cutoff,
+                cutoff,
+                cutoff,
+                "B",
+                0,
+                f"Alpha Vantage {peer} collection failed: {type(exc).__name__}",
+                normalized_payload_sha256=sha256_text(f"alpha-error-{peer}-{type(exc).__name__}-{cutoff}"),
+                snapshot_metadata={"peer_symbol": peer, "quality_label": "MISSING", "error_class": type(exc).__name__},
+            )
+            feats = [
+                {"name": f"{peer.lower()}_{suffix}", "status": "MISSING_OPTIONAL", "missing_reason": snap.missing_reason}
+                for suffix in ("adjusted_close", "volume", "one_day_return_bps")
+            ]
+            results[peer] = (snap, feats)
+    return results
+
+
 def collect_global_inputs_for_symbol(
     conn: sqlite3.Connection,
     *,
@@ -800,6 +955,8 @@ def collect_global_inputs_for_symbol(
     fixtures: Mapping[str, Any] | None = None,
     alpha_vantage_key: str | None | object = ENV_KEY,
     bok_ecos_key: str | None | object = ENV_KEY,
+    pacer: RequestPacer | None = None,
+    alpha_peer_results: Mapping[str, tuple[SourceSnapshot, list[dict[str, Any]]]] | None = None,
 ) -> CollectionResult:
     """Collect normalized global inputs for one domestic ledger symbol.
 
@@ -808,6 +965,7 @@ def collect_global_inputs_for_symbol(
     and `fred_dexkous_csv`.
     """
     fixtures = fixtures or {}
+    pacer = pacer or RequestPacer()
     capture_date = available_data_cutoff[:10]
     resolved_alpha_key = cast(str | None, os.getenv("ALPHAVANTAGE_API_KEY") if alpha_vantage_key is ENV_KEY else alpha_vantage_key)
     resolved_bok_key = cast(str | None, os.getenv("BOK_ECOS_KEY") if bok_ecos_key is ENV_KEY else bok_ecos_key)
@@ -853,34 +1011,16 @@ def collect_global_inputs_for_symbol(
             )
             features_inserted += insert_feature(conn, feature)
 
-    alpha_fixtures = fixtures.get("alpha_vantage", {})
+    if alpha_peer_results is None:
+        alpha_peer_results = collect_alpha_peer_results(
+            cutoff=available_data_cutoff,
+            http_get=http_get,
+            api_key=resolved_alpha_key,
+            alpha_fixtures=fixtures.get("alpha_vantage", {}),
+            pacer=pacer,
+        )
     for peer in GLOBAL_PEERS:
-        try:
-            snap, feats = collect_alpha_vantage_peer(
-                peer,
-                cutoff=available_data_cutoff,
-                ingested_at_kst=available_data_cutoff,
-                http_get=http_get,
-                api_key=resolved_alpha_key,
-                fixture_payload=alpha_fixtures.get(peer),
-            )
-        except Exception as exc:  # network/schema fallback is represented in ledger, not raised
-            snap = SourceSnapshot(
-                None,
-                None,
-                "alpha_vantage_daily_adjusted",
-                "global_price",
-                "MISSING",
-                available_data_cutoff,
-                available_data_cutoff,
-                available_data_cutoff,
-                "B",
-                0,
-                f"Alpha Vantage {peer} collection failed: {type(exc).__name__}",
-                normalized_payload_sha256=sha256_text(f"alpha-error-{peer}-{type(exc).__name__}-{available_data_cutoff}"),
-                snapshot_metadata={"peer_symbol": peer, "quality_label": "MISSING", "error_class": type(exc).__name__},
-            )
-            feats = [{"name": f"{peer.lower()}_adjusted_close", "status": "MISSING_OPTIONAL", "missing_reason": snap.missing_reason}]
+        snap, feats = alpha_peer_results[peer]
         persist(snap, feats, "global_semiconductor_price_context")
 
     try:
@@ -925,8 +1065,19 @@ def collect_global_inputs(
     available_data_cutoff: str,
     fixtures: Mapping[str, Any] | None = None,
     http_get: HttpGet = default_http_get,
+    pacer: RequestPacer | None = None,
 ) -> dict[str, CollectionResult]:
     results: dict[str, CollectionResult] = {}
+    pacer = pacer or RequestPacer()
+    # Alpha 피어는 글로벌 스냅샷이므로 run 당 1회만 수집(피어 3건 → live 요청 3회, pacing 2회)하고
+    # 모든 국내 심볼의 feature lineage 가 동일한 immutable 결과를 재사용한다.
+    alpha_peer_results = collect_alpha_peer_results(
+        cutoff=available_data_cutoff,
+        http_get=http_get,
+        api_key=cast(str | None, os.getenv("ALPHAVANTAGE_API_KEY")),
+        alpha_fixtures=(fixtures or {}).get("alpha_vantage", {}),
+        pacer=pacer,
+    )
     for symbol in symbols:
         run_id = stable_id("run", {"symbol": symbol, "trading_date": trading_date, "cutoff": available_data_cutoff, "collector": "global-v1"})
         results[symbol] = collect_global_inputs_for_symbol(
@@ -938,6 +1089,8 @@ def collect_global_inputs(
             available_data_cutoff=available_data_cutoff,
             fixtures=fixtures,
             http_get=http_get,
+            pacer=pacer,
+            alpha_peer_results=alpha_peer_results,
         )
     return results
 
