@@ -12,17 +12,19 @@ available_data_cutoff)은 cross-database FK 없이 불변 외부 참조 값으�
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
+from functools import wraps
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 MIGRATION_001 = MIGRATIONS_DIR / "001_autonomous_paper_trading_ledgers.sql"
 
 SUPPORTED_SYMBOLS = frozenset({"005930", "000660"})
-AGENT_ACTIONS = frozenset({"BUY", "SELL", "HOLD", "ABSTAIN"})
+AGENT_ACTIONS = frozenset({"ENTER", "HOLD", "REDUCE", "EXIT", "ABSTAIN"})
 PROPOSAL_SIDES = frozenset({"BUY", "SELL"})
 RISK_VERDICTS = frozenset({"APPROVE", "REJECT", "RESIZE"})
 ORDER_TERMINAL_EVENT_TYPES = frozenset({"FILLED", "CANCELLED", "EXPIRED"})
@@ -54,6 +56,15 @@ class LedgerConflictError(LedgerError):
     """동일 식별자/멱등 키 재생 시 payload 가 기존 기록과 다른 경우."""
 
 
+def _write_transaction(method):
+    """Put every mutation read/replay check behind the SQLite write lock."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.transaction_immediate():
+            return method(self, *args, **kwargs)
+    return locked
+
+
 def _require_tz_iso(name: str, value: str) -> str:
     try:
         parsed = datetime.fromisoformat(str(value))
@@ -69,6 +80,19 @@ def _require_int(name: str, value: Any, *, minimum: int | None = None) -> int:
         raise LedgerError(f"{name}: integer required, got {value!r}")
     if minimum is not None and value < minimum:
         raise LedgerError(f"{name}: must be >= {minimum}, got {value}")
+    return value
+
+
+def _require_kst_iso(name: str, value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value) if type(value) is str else None
+    except ValueError:
+        parsed = None
+    if (parsed is None or parsed.tzinfo is None
+            or parsed.utcoffset() is None
+            or parsed.utcoffset().total_seconds() != 9 * 3600
+            or not value.endswith("+09:00")):
+        raise LedgerError(f"{name}: timestamp with explicit +09:00 offset required")
     return value
 
 
@@ -101,6 +125,7 @@ class PaperLedger:
         self.conn.execute("PRAGMA busy_timeout = 5000")
         self.conn.executescript(MIGRATION_001.read_text(encoding="utf-8"))
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self._savepoint_seq = 0
 
     def close(self) -> None:
         self.conn.close()
@@ -116,7 +141,12 @@ class PaperLedger:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def _txn(self) -> Iterator[None]:
+    def transaction_immediate(self) -> Iterator[None]:
+        """Serialize authoritative reads and writes; nest safely via SAVEPOINT."""
+        if self.conn.in_transaction:
+            with self._savepoint():
+                yield
+            return
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield
@@ -124,6 +154,24 @@ class PaperLedger:
             self.conn.execute("ROLLBACK")
             raise
         self.conn.execute("COMMIT")
+
+    @contextmanager
+    def _savepoint(self) -> Iterator[None]:
+        self._savepoint_seq += 1
+        name = f"paper_ledger_{self._savepoint_seq}"
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute(f"ROLLBACK TO {name}")
+            self.conn.execute(f"RELEASE {name}")
+            raise
+        self.conn.execute(f"RELEASE {name}")
+
+    @contextmanager
+    def _txn(self) -> Iterator[None]:
+        with self.transaction_immediate():
+            yield
 
     def _fetch_row(self, table: str, key_col: str, key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -169,6 +217,7 @@ class PaperLedger:
     # append (모두 트랜잭션 안전 + 결정적 중복 처리)
     # ------------------------------------------------------------------
 
+    @_write_transaction
     def create_account(
         self, *, account_id: str, initial_cash_krw: int, policy_version: str, created_at: str
     ) -> str:
@@ -188,12 +237,13 @@ class PaperLedger:
             self._insert("paper_accounts", row)
         return account_id
 
+    @_write_transaction
     def append_account_event(
         self, *, account_event_id: str, account_id: str, event_type: str,
         event_at: str, reason_code: str | None = None,
     ) -> str:
         _require_choice("event_type", event_type, frozenset({"ENABLED", "DISABLED"}))
-        event_at = _require_tz_iso("event_at", event_at)
+        event_at = _require_kst_iso("event_at", event_at)
         if reason_code is not None:
             _require_choice("reason_code", reason_code, ACCOUNT_EVENT_REASON_CODES)
         row = {
@@ -211,6 +261,7 @@ class PaperLedger:
             self._insert("paper_account_events", row)
         return account_event_id
 
+    @_write_transaction
     def append_agent_decision(
         self, *, decision_id: str, account_id: str, symbol: str,
         ksf_run_id: str, ksf_decision_id: str, feature_snapshot_sha256: str,
@@ -241,20 +292,24 @@ class PaperLedger:
             self._insert("paper_agent_decisions", row)
         return decision_id
 
+    @_write_transaction
     def append_order_proposal(
-        self, *, proposal_id: str, decision_id: str, side: str, quantity: int,
+        self, *, proposal_id: str, decision_id: str, side: str,
         target_exposure_bp: int, idempotency_key: str,
         model_name: str, model_version: str, proposed_at: str,
     ) -> str:
         _require_choice("side", side, PROPOSAL_SIDES)
-        _require_int("quantity", quantity, minimum=1)
-        _require_int("target_exposure_bp", target_exposure_bp, minimum=1)
+        _require_int("target_exposure_bp", target_exposure_bp, minimum=0)
+        if target_exposure_bp > 10_000:
+            raise LedgerError("target_exposure_bp: must be <= 10000")
         decision = self._fetch_row("paper_agent_decisions", "decision_id", decision_id)
         if decision is None:
             raise LedgerError(f"unknown decision_id {decision_id!r}")
-        if decision["action"] != side:
+        expected = {"ENTER": ("BUY", True), "REDUCE": ("SELL", True), "EXIT": ("SELL", False)}
+        binding = expected.get(decision["action"])
+        if binding is None or binding[0] != side or binding[1] != (target_exposure_bp > 0):
             raise LedgerError(
-                f"proposal side {side!r} must match decision action {decision['action']!r}"
+                f"proposal side/target must exactly match decision action {decision['action']!r}"
             )
         row = {
             "proposal_id": proposal_id,
@@ -262,7 +317,6 @@ class PaperLedger:
             "account_id": decision["account_id"],
             "symbol": decision["symbol"],
             "side": side,
-            "quantity": quantity,
             "target_exposure_bp": target_exposure_bp,
             "idempotency_key": idempotency_key,
             "model_name": model_name,
@@ -276,10 +330,11 @@ class PaperLedger:
             self._insert("paper_order_proposals", row)
         return proposal_id
 
+    @_write_transaction
     def append_risk_review(
         self, *, review_id: str, proposal_id: str, verdict: str, policy_sha256: str,
         reviewed_at: str, approved_quantity: int | None = None,
-        reject_reason_code: str | None = None,
+        reject_reason_code: str | None = None, reference_price_krw: int | None = None,
     ) -> str:
         _require_choice("verdict", verdict, RISK_VERDICTS)
         if verdict == "REJECT":
@@ -290,12 +345,16 @@ class PaperLedger:
             if reject_reason_code is not None:
                 raise LedgerError(f"{verdict} must not carry a reject_reason_code")
             _require_int("approved_quantity", approved_quantity, minimum=1)
+            _require_int("reference_price_krw", reference_price_krw, minimum=1)
+        if verdict == "REJECT" and reference_price_krw is not None:
+            raise LedgerError("REJECT must not carry reference_price_krw")
         row = {
             "review_id": review_id,
             "proposal_id": proposal_id,
             "verdict": verdict,
             "reject_reason_code": reject_reason_code,
             "approved_quantity": approved_quantity,
+            "reference_price_krw": reference_price_krw,
             "policy_sha256": _require_sha256("policy_sha256", policy_sha256),
             "reviewed_at": _require_tz_iso("reviewed_at", reviewed_at),
         }
@@ -305,6 +364,7 @@ class PaperLedger:
             self._insert("paper_risk_reviews", row)
         return review_id
 
+    @_write_transaction
     def append_order(
         self, *, order_id: str, review_id: str, idempotency_key: str, created_at: str
     ) -> str:
@@ -342,6 +402,7 @@ class PaperLedger:
             self._insert("paper_orders", row)
         return order_id
 
+    @_write_transaction
     def append_order_event(
         self, *, order_event_id: str, order_id: str, event_type: str, event_at: str
     ) -> str:
@@ -361,6 +422,7 @@ class PaperLedger:
             self._insert("paper_order_events", row)
         return order_event_id
 
+    @_write_transaction
     def append_fill(
         self, *, fill_id: str, order_id: str, fill_price_krw: int, quantity: int,
         fee_krw: int, tax_krw: int, slippage_krw: int,
@@ -406,30 +468,66 @@ class PaperLedger:
             self._insert("paper_fills", row)
         return fill_id
 
+    @_write_transaction
     def append_nav_snapshot(
         self, *, nav_snapshot_id: str, account_id: str, session_date: str,
-        cash_krw: int, position_value_krw: int, nav_krw: int, snapshot_at: str,
+        cash_krw: int, position_value_krw: int, nav_krw: int,
+        position_marks: Mapping[str, Mapping[str, Any]], snapshot_at: str,
     ) -> str:
         _require_int("cash_krw", cash_krw, minimum=0)
         _require_int("position_value_krw", position_value_krw, minimum=0)
         _require_int("nav_krw", nav_krw)
         if nav_krw != cash_krw + position_value_krw:
             raise LedgerError("nav_krw must equal cash_krw + position_value_krw")
+        if type(position_marks) is not dict:
+            raise LedgerError("position marks must be an exact mapping")
+        normalized: dict[str, dict[str, Any]] = {}
+        for symbol, mark in position_marks.items():
+            if type(symbol) is not str or symbol not in SUPPORTED_SYMBOLS or type(mark) is not dict \
+                    or set(mark) != {"quantity", "price_krw", "feature_snapshot_sha256", "observed_at"}:
+                raise LedgerError("position marks have invalid schema")
+            quantity = _require_int("position mark quantity", mark["quantity"], minimum=1)
+            price = _require_int("position mark price_krw", mark["price_krw"], minimum=1)
+            observed_at = _require_tz_iso("position mark observed_at", mark["observed_at"])
+            if datetime.fromisoformat(observed_at).utcoffset().total_seconds() != 9 * 3600:
+                raise LedgerError("position mark observed_at must use explicit +09:00")
+            normalized[symbol] = {"quantity": quantity, "price_krw": price,
+                "feature_snapshot_sha256": _require_sha256(
+                    "position mark feature_snapshot_sha256", mark["feature_snapshot_sha256"]),
+                "observed_at": observed_at}
+        snapshot_at = _require_tz_iso("snapshot_at", snapshot_at)
+        snapshot_time = datetime.fromisoformat(snapshot_at)
+        if snapshot_time.utcoffset().total_seconds() != 9 * 3600 or snapshot_time.date().isoformat() != session_date:
+            raise LedgerError("snapshot_at must use +09:00 and its date must equal session_date")
+        if any(datetime.fromisoformat(mark["observed_at"]) > snapshot_time for mark in normalized.values()):
+            raise LedgerError("position mark observed_at must not be after snapshot_at")
         row = {
             "nav_snapshot_id": nav_snapshot_id,
             "account_id": account_id,
             "session_date": session_date,
             "cash_krw": cash_krw,
             "position_value_krw": position_value_krw,
+            "position_marks_json": json.dumps(normalized, sort_keys=True, separators=(",", ":")),
             "nav_krw": nav_krw,
-            "snapshot_at": _require_tz_iso("snapshot_at", snapshot_at),
+            "snapshot_at": snapshot_at,
         }
-        if self._is_replay("paper_nav_snapshots", "nav_snapshot_id", row):
-            return nav_snapshot_id
-        with self._txn():
+        with self.transaction_immediate():
+            positions = self.positions_as_of(account_id, snapshot_at)
+            if set(normalized) != set(positions) or any(
+                normalized[s]["quantity"] != positions[s] for s in positions
+            ):
+                raise LedgerError("position marks must exactly match event-sourced positions")
+            marked_value = sum(m["quantity"] * m["price_krw"] for m in normalized.values())
+            if marked_value != position_value_krw:
+                raise LedgerError("position marks must exactly sum to position_value_krw")
+            if self.cash_balance_as_of(account_id, snapshot_at) != cash_krw:
+                raise LedgerError("cash_krw must exactly match event-sourced cash")
+            if self._is_replay("paper_nav_snapshots", "nav_snapshot_id", row):
+                return nav_snapshot_id
             self._insert("paper_nav_snapshots", row)
         return nav_snapshot_id
 
+    @_write_transaction
     def append_kill_switch_event(
         self, *, kill_switch_event_id: str, account_id: str, event_type: str,
         reason_code: str, event_at: str,
@@ -442,7 +540,7 @@ class PaperLedger:
             "seq": None,
             "event_type": event_type,
             "reason_code": reason_code,
-            "event_at": _require_tz_iso("event_at", event_at),
+            "event_at": _require_kst_iso("event_at", event_at),
         }
         if self._is_replay("paper_kill_switch_events", "kill_switch_event_id", row, ignore=("seq",)):
             return kill_switch_event_id
@@ -461,6 +559,21 @@ class PaperLedger:
             (account_id,),
         ).fetchone()[0]
 
+    def cash_balance_as_of(self, account_id: str, as_of: str) -> int:
+        cutoff = datetime.fromisoformat(_require_tz_iso("as_of", as_of))
+        total = 0
+        for row in self.conn.execute(
+            "SELECT amount_krw,event_at FROM paper_cash_events WHERE account_id=?", (account_id,)):
+            try:
+                event_time = datetime.fromisoformat(row["event_at"])
+            except (TypeError, ValueError) as exc:
+                raise LedgerError("cash event has malformed timestamp") from exc
+            if event_time.tzinfo is None:
+                raise LedgerError("cash event has malformed timestamp")
+            if event_time <= cutoff:
+                total += _require_int("cash event amount_krw", row["amount_krw"])
+        return total
+
     def positions(self, account_id: str) -> dict[str, int]:
         rows = self.conn.execute(
             """
@@ -472,11 +585,31 @@ class PaperLedger:
         ).fetchall()
         return {row["symbol"]: row["qty"] for row in rows}
 
+    def positions_as_of(self, account_id: str, as_of: str) -> dict[str, int]:
+        cutoff = datetime.fromisoformat(_require_tz_iso("as_of", as_of))
+        totals: dict[str, int] = {}
+        for row in self.conn.execute(
+            "SELECT symbol,quantity_delta,event_at FROM paper_position_events WHERE account_id=?",
+            (account_id,)):
+            try:
+                event_time = datetime.fromisoformat(row["event_at"])
+            except (TypeError, ValueError) as exc:
+                raise LedgerError("position event has malformed timestamp") from exc
+            if event_time.tzinfo is None:
+                raise LedgerError("position event has malformed timestamp")
+            if event_time <= cutoff:
+                symbol = _require_choice("position event symbol", row["symbol"], SUPPORTED_SYMBOLS)
+                totals[symbol] = totals.get(symbol, 0) + _require_int(
+                    "position event quantity_delta", row["quantity_delta"])
+        if any(quantity < 0 for quantity in totals.values()):
+            raise LedgerError("event-sourced position is negative")
+        return {symbol: quantity for symbol, quantity in totals.items() if quantity}
+
     def latest_nav(self, account_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
             SELECT * FROM paper_nav_snapshots WHERE account_id = ?
-            ORDER BY session_date DESC LIMIT 1
+            ORDER BY session_date DESC, snapshot_at DESC, nav_snapshot_id DESC LIMIT 1
             """,
             (account_id,),
         ).fetchone()

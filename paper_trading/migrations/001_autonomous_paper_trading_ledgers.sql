@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS paper_agent_decisions (
         julianday(available_data_cutoff) IS NOT NULL
         AND (substr(available_data_cutoff, -1) = 'Z' OR (substr(available_data_cutoff, -6, 1) IN ('+','-') AND substr(available_data_cutoff, -3, 1) = ':'))
     ),
-    action TEXT NOT NULL CHECK (action IN ('BUY','SELL','HOLD','ABSTAIN')),
+    action TEXT NOT NULL CHECK (action IN ('ENTER','HOLD','REDUCE','EXIT','ABSTAIN')),
     reason_code TEXT NOT NULL CHECK (reason_code IN (
         'FLOW_SIGNAL_POSITIVE','FLOW_SIGNAL_NEGATIVE','NO_EDGE',
         'DATA_STALE','DATA_MISSING','DATA_RESTRICTED',
@@ -115,8 +115,7 @@ CREATE TABLE IF NOT EXISTS paper_order_proposals (
     account_id TEXT NOT NULL REFERENCES paper_accounts(account_id),
     symbol TEXT NOT NULL CHECK (symbol IN ('005930','000660')),
     side TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
-    quantity INTEGER NOT NULL CHECK (typeof(quantity) = 'integer' AND quantity > 0),
-    target_exposure_bp INTEGER NOT NULL CHECK (typeof(target_exposure_bp) = 'integer' AND target_exposure_bp BETWEEN 1 AND 10000),
+    target_exposure_bp INTEGER NOT NULL CHECK (typeof(target_exposure_bp) = 'integer' AND target_exposure_bp BETWEEN 0 AND 10000),
     idempotency_key TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) > 0),
     model_name TEXT NOT NULL CHECK (length(model_name) > 0),
     model_version TEXT NOT NULL CHECK (length(model_version) > 0),
@@ -133,7 +132,11 @@ FOR EACH ROW
 WHEN EXISTS (
     SELECT 1 FROM paper_agent_decisions d
     WHERE d.decision_id = NEW.decision_id
-      AND (d.action != NEW.side OR d.account_id != NEW.account_id OR d.symbol != NEW.symbol)
+      AND (d.account_id != NEW.account_id OR d.symbol != NEW.symbol
+           OR (d.action = 'ENTER' AND (NEW.side != 'BUY' OR NEW.target_exposure_bp = 0))
+           OR (d.action = 'REDUCE' AND (NEW.side != 'SELL' OR NEW.target_exposure_bp = 0))
+           OR (d.action = 'EXIT' AND (NEW.side != 'SELL' OR NEW.target_exposure_bp != 0))
+           OR d.action IN ('HOLD','ABSTAIN'))
 )
 BEGIN
     SELECT RAISE(ABORT, 'paper_order_proposals: side/account/symbol must match the referenced agent decision');
@@ -153,6 +156,7 @@ CREATE TABLE IF NOT EXISTS paper_risk_reviews (
         'DAILY_FILL_LIMIT','DAILY_LOSS_STOP','DRAWDOWN_STOP','MIN_NOTIONAL'
     )),
     approved_quantity INTEGER CHECK (approved_quantity IS NULL OR (typeof(approved_quantity) = 'integer' AND approved_quantity > 0)),
+    reference_price_krw INTEGER CHECK (reference_price_krw IS NULL OR (typeof(reference_price_krw) = 'integer' AND reference_price_krw > 0)),
     policy_sha256 TEXT NOT NULL CHECK (
         length(policy_sha256) = 64
         AND policy_sha256 = lower(policy_sha256)
@@ -164,6 +168,7 @@ CREATE TABLE IF NOT EXISTS paper_risk_reviews (
     ),
     CHECK ((verdict = 'REJECT') = (reject_reason_code IS NOT NULL)),
     CHECK ((verdict = 'REJECT') = (approved_quantity IS NULL))
+    ,CHECK ((verdict = 'REJECT') = (reference_price_krw IS NULL))
 );
 
 -- ---------------------------------------------------------------------------
@@ -359,14 +364,45 @@ CREATE TABLE IF NOT EXISTS paper_nav_snapshots (
     session_date TEXT NOT NULL CHECK (session_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     cash_krw INTEGER NOT NULL CHECK (typeof(cash_krw) = 'integer' AND cash_krw >= 0),
     position_value_krw INTEGER NOT NULL CHECK (typeof(position_value_krw) = 'integer' AND position_value_krw >= 0),
+    position_marks_json TEXT NOT NULL CHECK (json_valid(position_marks_json) AND json_type(position_marks_json) = 'object'),
     nav_krw INTEGER NOT NULL CHECK (typeof(nav_krw) = 'integer'),
     snapshot_at TEXT NOT NULL CHECK (
         julianday(snapshot_at) IS NOT NULL
         AND (substr(snapshot_at, -1) = 'Z' OR (substr(snapshot_at, -6, 1) IN ('+','-') AND substr(snapshot_at, -3, 1) = ':'))
     ),
     CHECK (nav_krw = cash_krw + position_value_krw),
-    UNIQUE (account_id, session_date)
+    UNIQUE (account_id, session_date, snapshot_at)
 );
+
+CREATE INDEX IF NOT EXISTS ix_paper_nav_snapshots_latest
+ON paper_nav_snapshots(account_id, session_date DESC, snapshot_at DESC);
+
+DROP TRIGGER IF EXISTS trg_paper_nav_snapshots_marks_integrity;
+CREATE TRIGGER trg_paper_nav_snapshots_marks_integrity
+BEFORE INSERT ON paper_nav_snapshots
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.position_marks_json) j
+    WHERE j.key NOT IN ('005930','000660') OR json_type(j.value) != 'object'
+       OR (SELECT count(*) FROM json_each(j.value)) != 4
+       OR json_type(j.value, '$.quantity') IS NOT 'integer'
+       OR json_extract(j.value, '$.quantity') <= 0
+       OR json_type(j.value, '$.price_krw') IS NOT 'integer'
+       OR json_extract(j.value, '$.price_krw') <= 0
+       OR json_type(j.value, '$.feature_snapshot_sha256') IS NOT 'text'
+       OR length(json_extract(j.value, '$.feature_snapshot_sha256')) != 64
+       OR json_extract(j.value, '$.feature_snapshot_sha256') != lower(json_extract(j.value, '$.feature_snapshot_sha256'))
+       OR json_extract(j.value, '$.feature_snapshot_sha256') GLOB '*[^0-9a-f]*'
+       OR json_type(j.value, '$.observed_at') IS NOT 'text'
+       OR julianday(json_extract(j.value, '$.observed_at')) IS NULL
+       OR substr(json_extract(j.value, '$.observed_at'), -6) NOT GLOB '+[0-9][0-9]:[0-9][0-9]'
+       OR substr(json_extract(j.value, '$.observed_at'), -6) != '+09:00'
+       OR julianday(json_extract(j.value, '$.observed_at')) > julianday(NEW.snapshot_at)
+) OR COALESCE((SELECT sum(json_extract(value,'$.quantity') * json_extract(value,'$.price_krw'))
+               FROM json_each(NEW.position_marks_json)), 0) != NEW.position_value_krw
+BEGIN
+    SELECT RAISE(ABORT, 'paper_nav_snapshots: invalid canonical position marks');
+END;
 
 -- ---------------------------------------------------------------------------
 -- Kill-switch events (state derived from latest event; fail-closed in code)
@@ -449,7 +485,8 @@ DROP TRIGGER IF EXISTS trg_paper_account_events_causal_time;
 CREATE TRIGGER trg_paper_account_events_causal_time
 BEFORE INSERT ON paper_account_events
 FOR EACH ROW
-WHEN julianday(NEW.event_at) < (SELECT julianday(a.created_at) FROM paper_accounts a WHERE a.account_id = NEW.account_id)
+WHEN substr(NEW.event_at, -6) != '+09:00'
+  OR julianday(NEW.event_at) < (SELECT julianday(a.created_at) FROM paper_accounts a WHERE a.account_id = NEW.account_id)
   OR julianday(NEW.event_at) < (SELECT MAX(julianday(e.event_at)) FROM paper_account_events e WHERE e.account_id = NEW.account_id)
 BEGIN
     SELECT RAISE(ABORT, 'paper_account_events: event_at must not precede account creation or prior events');
@@ -459,7 +496,8 @@ DROP TRIGGER IF EXISTS trg_paper_kill_switch_events_causal_time;
 CREATE TRIGGER trg_paper_kill_switch_events_causal_time
 BEFORE INSERT ON paper_kill_switch_events
 FOR EACH ROW
-WHEN julianday(NEW.event_at) < (SELECT julianday(a.created_at) FROM paper_accounts a WHERE a.account_id = NEW.account_id)
+WHEN substr(NEW.event_at, -6) != '+09:00'
+  OR julianday(NEW.event_at) < (SELECT julianday(a.created_at) FROM paper_accounts a WHERE a.account_id = NEW.account_id)
   OR julianday(NEW.event_at) < (SELECT MAX(julianday(e.event_at)) FROM paper_kill_switch_events e WHERE e.account_id = NEW.account_id)
 BEGIN
     SELECT RAISE(ABORT, 'paper_kill_switch_events: event_at must not precede account creation or prior events');
@@ -490,21 +528,9 @@ BEGIN
     SELECT RAISE(ABORT, 'paper_fills: observed_at must be strictly after order created_at');
 END;
 
--- Blocker 3: risk quantity semantics (REJECT shape is a table-level CHECK) ---
-
+-- Risk-owned quantity semantics are enforced by paper_risk_reviews' shape CHECK.
+-- Proposals intentionally contain no quantity supplied by the agent.
 DROP TRIGGER IF EXISTS trg_paper_risk_reviews_quantity_semantics;
-CREATE TRIGGER trg_paper_risk_reviews_quantity_semantics
-BEFORE INSERT ON paper_risk_reviews
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1 FROM paper_order_proposals p
-    WHERE p.proposal_id = NEW.proposal_id
-      AND ((NEW.verdict = 'APPROVE' AND NEW.approved_quantity != p.quantity)
-        OR (NEW.verdict = 'RESIZE' AND NEW.approved_quantity >= p.quantity))
-)
-BEGIN
-    SELECT RAISE(ABORT, 'paper_risk_reviews: APPROVE quantity must equal proposal quantity; RESIZE must be strictly smaller');
-END;
 
 -- Blocker 5: derived balance fail-safes at fill INSERT -----------------------
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,12 @@ TS_CUTOFF = "2026-08-05T15:30:00+09:00"
 TS_FILL = "2026-08-06T09:01:00+09:00"
 SHA_A = "a" * 64
 SHA_B = "b" * 64
+
+
+def mark(quantity: int, price_krw: int, *, sha: str = SHA_A,
+         observed_at: str = TS_CUTOFF) -> dict[str, object]:
+    return {"quantity": quantity, "price_krw": price_krw,
+            "feature_snapshot_sha256": sha, "observed_at": observed_at}
 
 APPEND_ONLY_TABLES = [
     "paper_accounts",
@@ -75,7 +82,7 @@ def seed_account(led: PaperLedger, account_id: str = "acct-1") -> str:
     )
 
 
-def seed_decision(led: PaperLedger, decision_id: str = "dec-1", *, action: str = "BUY") -> str:
+def seed_decision(led: PaperLedger, decision_id: str = "dec-1", *, action: str = "ENTER") -> str:
     return led.append_agent_decision(
         decision_id=decision_id,
         account_id="acct-1",
@@ -96,7 +103,6 @@ def seed_proposal(led: PaperLedger, proposal_id: str = "prop-1", decision_id: st
         proposal_id=proposal_id,
         decision_id=decision_id,
         side="BUY",
-        quantity=10,
         target_exposure_bp=1_000,
         idempotency_key=f"idem-{proposal_id}",
         model_name="kronos-mini",
@@ -113,10 +119,13 @@ def seed_review(led: PaperLedger, review_id: str = "rev-1", proposal_id: str = "
         proposal_id=proposal_id,
         verdict="APPROVE",
         approved_quantity=10,
+        reference_price_krw=70_000,
         policy_sha256=SHA_A,
         reviewed_at=TS_CREATE,
     )
     kwargs.update(over)
+    if kwargs["verdict"] == "REJECT":
+        kwargs["reference_price_krw"] = None
     return led.append_risk_review(**kwargs)
 
 
@@ -148,10 +157,12 @@ def seed_fill(led: PaperLedger, fill_id: str = "fill-1", order_id: str = "ord-1"
     return led.append_fill(**kwargs)
 
 
-def seed_order_chain(led: PaperLedger, tag: str, *, action: str = "BUY", quantity: int = 10) -> str:
+def seed_order_chain(led: PaperLedger, tag: str, *, action: str = "ENTER", quantity: int = 10) -> str:
     """decision → proposal → APPROVE review → order 체인을 한 번에 구성."""
     seed_decision(led, f"dec-{tag}", action=action)
-    seed_proposal(led, f"prop-{tag}", f"dec-{tag}", side=action, quantity=quantity)
+    seed_proposal(led, f"prop-{tag}", f"dec-{tag}",
+                  side="BUY" if action == "ENTER" else "SELL",
+                  target_exposure_bp=0 if action == "EXIT" else 1_000)
     seed_review(led, f"rev-{tag}", f"prop-{tag}", approved_quantity=quantity)
     seed_order(led, f"ord-{tag}", f"rev-{tag}")
     return f"ord-{tag}"
@@ -226,6 +237,7 @@ def seeded(ledger: PaperLedger) -> PaperLedger:
         session_date="2026-08-06",
         cash_krw=9_299_895,
         position_value_krw=700_000,
+        position_marks={"005930": mark(10, 70_000)},
         nav_krw=9_999_895,
         snapshot_at=TS_FILL,
     )
@@ -340,9 +352,9 @@ def test_proposal_requires_existing_decision_fk(seeded: PaperLedger) -> None:
         seeded.conn.execute(
             """
             INSERT INTO paper_order_proposals
-            (proposal_id, decision_id, account_id, symbol, side, quantity,
+            (proposal_id, decision_id, account_id, symbol, side,
              target_exposure_bp, idempotency_key, model_name, model_version, proposed_at)
-            VALUES ('prop-x', 'no-such-decision', 'acct-1', '005930', 'BUY', 1,
+            VALUES ('prop-x', 'no-such-decision', 'acct-1', '005930', 'BUY',
                     100, 'idem-x', 'kronos-mini', 'v1', ?)
             """,
             (TS_CREATE,),
@@ -417,7 +429,7 @@ def raw_insert_decision(conn: sqlite3.Connection, **over) -> None:
         ksf_decision_id="ksf-dec-raw",
         feature_snapshot_sha256=SHA_A,
         available_data_cutoff=TS_CUTOFF,
-        action="BUY",
+        action="ENTER",
         reason_code="FLOW_SIGNAL_POSITIVE",
         rationale_sha256=SHA_B,
         created_at=TS_CREATE,
@@ -468,9 +480,9 @@ def test_check_proposal_side_buy_sell_only(seeded: PaperLedger) -> None:
         seeded.conn.execute(
             """
             INSERT INTO paper_order_proposals
-            (proposal_id, decision_id, account_id, symbol, side, quantity,
+            (proposal_id, decision_id, account_id, symbol, side,
              target_exposure_bp, idempotency_key, model_name, model_version, proposed_at)
-            VALUES ('prop-h', 'dec-raw', 'acct-1', '005930', 'HOLD', 1,
+            VALUES ('prop-h', 'dec-raw', 'acct-1', '005930', 'HOLD',
                     100, 'idem-h', 'kronos-mini', 'v1', ?)
             """,
             (TS_CREATE,),
@@ -499,7 +511,6 @@ def test_check_no_float_money_storage(seeded: PaperLedger) -> None:
         "paper_position_events": ["quantity_delta"],
         "paper_nav_snapshots": ["cash_krw", "position_value_krw", "nav_krw"],
         "paper_orders": ["quantity"],
-        "paper_order_proposals": ["quantity"],
     }.items():
         info = {r[1]: r[2].upper() for r in seeded.conn.execute(f"PRAGMA table_info({table})")}
         for col in cols:
@@ -513,8 +524,9 @@ def test_check_nav_snapshot_consistency(seeded: PaperLedger) -> None:
         seeded.conn.execute(
             """
             INSERT INTO paper_nav_snapshots
-            (nav_snapshot_id, account_id, session_date, cash_krw, position_value_krw, nav_krw, snapshot_at)
-            VALUES ('nav-bad', 'acct-1', '2026-08-07', 100, 100, 999, ?)
+            (nav_snapshot_id, account_id, session_date, cash_krw, position_value_krw,
+             position_marks_json, nav_krw, snapshot_at)
+            VALUES ('nav-bad', 'acct-1', '2026-08-07', 100, 100, '{}', 999, ?)
             """,
             (TS_FILL,),
         )
@@ -527,8 +539,8 @@ def test_check_nav_snapshot_consistency(seeded: PaperLedger) -> None:
 
 def test_order_requires_non_reject_review(ledger: PaperLedger) -> None:
     seed_account(ledger)
-    seed_decision(ledger, "dec-r", action="SELL")
-    seed_proposal(ledger, "prop-r", "dec-r", side="SELL")
+    seed_decision(ledger, "dec-r", action="EXIT")
+    seed_proposal(ledger, "prop-r", "dec-r", side="SELL", target_exposure_bp=0)
     seed_review(
         ledger, "rev-r", "prop-r",
         verdict="REJECT", approved_quantity=None, reject_reason_code="POSITION_LIMIT",
@@ -607,7 +619,7 @@ def test_proposal_replay_identical_returns_existing(seeded: PaperLedger) -> None
 
 def test_proposal_replay_conflicting_rejected(seeded: PaperLedger) -> None:
     with pytest.raises(LedgerConflictError):
-        seed_proposal(seeded, quantity=99)  # 같은 proposal_id, 다른 내용
+        seed_proposal(seeded, target_exposure_bp=999)  # 같은 proposal_id, 다른 내용
     with pytest.raises((LedgerConflictError, sqlite3.IntegrityError)):
         seed_proposal(seeded, proposal_id="prop-dup", idempotency_key="idem-prop-1")
     count = seeded.conn.execute("SELECT COUNT(*) FROM paper_order_proposals").fetchone()[0]
@@ -714,6 +726,7 @@ def test_derived_latest_nav(seeded: PaperLedger) -> None:
         session_date="2026-08-07",
         cash_krw=9_299_895,
         position_value_krw=710_000,
+        position_marks={"005930": mark(10, 71_000)},
         nav_krw=10_009_895,
         snapshot_at="2026-08-07T16:00:00+09:00",
     )
@@ -947,20 +960,20 @@ def test_forged_fill_linked_position_event_rejected(seeded: PaperLedger) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_approve_quantity_must_equal_proposal_quantity(seeded: PaperLedger) -> None:
+def test_review_quantity_is_independent_of_proposal_and_drives_order(seeded: PaperLedger) -> None:
     seed_decision(seeded, "dec-q")
-    seed_proposal(seeded, "prop-q", "dec-q")  # quantity=10
-    with pytest.raises(sqlite3.IntegrityError):
-        seed_review(seeded, "rev-q-bad", "prop-q", approved_quantity=9)
-    seed_review(seeded, "rev-q", "prop-q", approved_quantity=10)  # 정상 경로 유지 확인
+    seed_proposal(seeded, "prop-q", "dec-q")
+    seed_review(seeded, "rev-q", "prop-q", approved_quantity=9)
+    seed_order(seeded, "ord-q", "rev-q")
+    assert seeded.conn.execute(
+        "SELECT quantity FROM paper_orders WHERE order_id='ord-q'"
+    ).fetchone()[0] == 9
 
 
-def test_resize_quantity_positive_and_strictly_smaller(seeded: PaperLedger) -> None:
+def test_resize_quantity_only_requires_positive_integer(seeded: PaperLedger) -> None:
     seed_decision(seeded, "dec-z")
     seed_proposal(seeded, "prop-z", "dec-z")  # quantity=10
-    for bad_qty, rid in ((10, "rev-z-eq"), (11, "rev-z-gt")):
-        with pytest.raises(sqlite3.IntegrityError):
-            seed_review(seeded, rid, "prop-z", verdict="RESIZE", approved_quantity=bad_qty)
+    seed_review(seeded, "rev-z-gt", "prop-z", verdict="RESIZE", approved_quantity=11)
     with pytest.raises(sqlite3.IntegrityError):  # 0 이하는 CHECK(approved_quantity > 0)
         seeded.conn.execute(
             """
@@ -970,7 +983,178 @@ def test_resize_quantity_positive_and_strictly_smaller(seeded: PaperLedger) -> N
             """,
             (SHA_A, TS_CREATE),
         )
-    seed_review(seeded, "rev-z", "prop-z", verdict="RESIZE", approved_quantity=5)  # 축소는 허용
+
+
+def test_transaction_immediate_composes_nested_appends_and_commits(ledger: PaperLedger) -> None:
+    with ledger.transaction_immediate():
+        ledger.create_account(account_id="acct-txn", initial_cash_krw=1_000_000,
+                              policy_version="v1", created_at=TS_CREATE)
+        ledger.append_account_event(account_event_id="enable-txn", account_id="acct-txn",
+            event_type="ENABLED", reason_code="MANUAL", event_at=TS_CREATE)
+    assert ledger.account_enabled("acct-txn") is True
+
+
+def test_transaction_immediate_nested_failure_can_be_caught_without_partial_inner_state(
+    ledger: PaperLedger,
+) -> None:
+    with ledger.transaction_immediate():
+        ledger.create_account(account_id="acct-txn", initial_cash_krw=1_000_000,
+                              policy_version="v1", created_at=TS_CREATE)
+        try:
+            ledger.append_account_event(account_event_id="bad-inner", account_id="missing",
+                event_type="ENABLED", reason_code="MANUAL", event_at=TS_CREATE)
+        except sqlite3.IntegrityError:
+            pass
+        ledger.append_account_event(account_event_id="enable-txn", account_id="acct-txn",
+            event_type="ENABLED", reason_code="MANUAL", event_at=TS_CREATE)
+    assert ledger.conn.execute(
+        "SELECT COUNT(*) FROM paper_account_events WHERE account_event_id='bad-inner'"
+    ).fetchone()[0] == 0
+    assert ledger.account_enabled("acct-txn") is True
+
+
+def test_nav_snapshot_rejects_phantom_value_and_requires_canonical_marks(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    with pytest.raises(LedgerError, match="position marks"):
+        ledger.append_nav_snapshot(
+            nav_snapshot_id="nav-phantom", account_id="acct-1", session_date="2026-08-05",
+            cash_krw=10_000_000, position_value_krw=10_000_000, nav_krw=20_000_000,
+            position_marks={}, snapshot_at=TS_CREATE,
+        )
+
+
+def test_nav_snapshot_rejects_event_sourced_quantity_mismatch(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    ledger.conn.execute("DROP TRIGGER trg_paper_position_events_match_fill")
+    ledger.conn.execute("PRAGMA foreign_keys=OFF")
+    ledger.conn.execute(
+        "INSERT INTO paper_position_events VALUES (?,?,?,?,?,?)",
+        ("pos-held", "acct-1", "005930", "historical-fill", 10, TS_EARLY))
+    ledger.conn.execute("PRAGMA foreign_keys=ON")
+    with pytest.raises(LedgerError, match="event-sourced positions"):
+        ledger.append_nav_snapshot(
+            nav_snapshot_id="nav-wrong-qty", account_id="acct-1", session_date="2026-08-05",
+            cash_krw=10_000_000, position_value_krw=630_000, nav_krw=10_630_000,
+            position_marks={"005930": mark(9, 70_000)},
+            snapshot_at=TS_CREATE)
+
+
+def test_multiple_same_session_nav_snapshots_and_latest_timestamp(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    ledger.append_nav_snapshot(nav_snapshot_id="nav-early", account_id="acct-1",
+        session_date="2026-08-05", cash_krw=10_000_000, position_value_krw=0,
+        nav_krw=10_000_000, position_marks={}, snapshot_at="2026-08-05T16:06:00+09:00")
+    ledger.append_nav_snapshot(nav_snapshot_id="nav-late", account_id="acct-1",
+        session_date="2026-08-05", cash_krw=10_000_000, position_value_krw=0,
+        nav_krw=10_000_000, position_marks={}, snapshot_at="2026-08-05T16:07:00+09:00")
+    assert ledger.latest_nav("acct-1")["nav_snapshot_id"] == "nav-late"
+
+
+def test_nav_snapshot_uses_event_state_as_of_snapshot_at(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    seed_decision(ledger)
+    seed_proposal(ledger)
+    seed_review(ledger)
+    seed_order(ledger)
+    seed_fill(ledger)
+    ledger.append_nav_snapshot(nav_snapshot_id="nav-before-fill", account_id="acct-1",
+        session_date="2026-08-05", cash_krw=10_000_000, position_value_krw=0,
+        nav_krw=10_000_000, position_marks={}, snapshot_at=TS_CREATE)
+    with pytest.raises(LedgerError, match="event-sourced"):
+        ledger.append_nav_snapshot(nav_snapshot_id="nav-forged-history", account_id="acct-1",
+            session_date="2026-08-05", cash_krw=9_299_895, position_value_krw=700_000,
+            nav_krw=9_999_895, position_marks={"005930": mark(10, 70_000)},
+            snapshot_at=TS_CREATE)
+
+
+def test_nav_mark_requires_exact_canonical_lineage(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    with pytest.raises(LedgerError, match="position marks"):
+        ledger.append_nav_snapshot(nav_snapshot_id="nav-old-shape", account_id="acct-1",
+            session_date="2026-08-05", cash_krw=10_000_000, position_value_krw=0,
+            nav_krw=10_000_000,
+            position_marks={"005930": {"quantity": 1, "price_krw": 1}},
+            snapshot_at=TS_CREATE)
+
+
+def test_two_connection_identical_account_retry_returns_same_id(tmp_path: Path) -> None:
+    path = tmp_path / "concurrent-account.sqlite3"
+    PaperLedger(path).close()
+    barrier = threading.Barrier(2)
+    init_lock = threading.Lock()
+    results: list[object] = []
+    def append() -> None:
+        with init_lock:
+            led = PaperLedger(path)
+        barrier.wait()
+        try:
+            results.append(led.create_account(account_id="acct-race", initial_cash_krw=1_000_000,
+                policy_version="v1", created_at=TS_CREATE))
+        except BaseException as exc:
+            results.append(exc)
+        finally:
+            led.close()
+    threads = [threading.Thread(target=append) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert results == ["acct-race", "acct-race"]
+
+
+def test_exact_decision_action_and_review_reference_price_are_persisted(ledger: PaperLedger) -> None:
+    seed_account(ledger)
+    seed_decision(ledger, action="REDUCE")
+    seed_proposal(ledger, side="SELL", target_exposure_bp=2_000)
+    seed_review(ledger, reference_price_krw=70_000)
+    row = ledger.conn.execute(
+        "SELECT d.action, r.reference_price_krw FROM paper_agent_decisions d "
+        "JOIN paper_order_proposals p ON p.decision_id=d.decision_id "
+        "JOIN paper_risk_reviews r ON r.proposal_id=p.proposal_id"
+    ).fetchone()
+    assert tuple(row) == ("REDUCE", 70_000)
+
+
+def test_transaction_immediate_outer_error_rolls_back_all_nested_appends(ledger: PaperLedger) -> None:
+    with pytest.raises(RuntimeError):
+        with ledger.transaction_immediate():
+            ledger.create_account(account_id="acct-txn", initial_cash_krw=1_000_000,
+                                  policy_version="v1", created_at=TS_CREATE)
+            raise RuntimeError("abort outer")
+    assert ledger.conn.execute(
+        "SELECT COUNT(*) FROM paper_accounts WHERE account_id='acct-txn'"
+    ).fetchone()[0] == 0
+
+
+def test_transaction_immediate_supports_two_active_nested_savepoints(ledger: PaperLedger) -> None:
+    with ledger.transaction_immediate():
+        with ledger.transaction_immediate():
+            ledger.create_account(
+                account_id="acct-txn", initial_cash_krw=1_000_000,
+                policy_version="v1", created_at=TS_CREATE,
+            )
+            with ledger.transaction_immediate():
+                ledger.append_account_event(
+                    account_event_id="enable-nested", account_id="acct-txn",
+                    event_type="ENABLED", reason_code="MANUAL", event_at=TS_CREATE,
+                )
+    assert ledger.account_enabled("acct-txn") is True
+
+
+def test_proposal_schema_has_no_quantity_and_sell_target_zero_replays(seeded: PaperLedger) -> None:
+    columns = {row[1] for row in seeded.conn.execute("PRAGMA table_info(paper_order_proposals)")}
+    assert "quantity" not in columns
+    seed_decision(seeded, "dec-exit", action="EXIT")
+    seed_proposal(seeded, "prop-exit", "dec-exit", side="SELL", target_exposure_bp=0)
+    seed_proposal(seeded, "prop-exit", "dec-exit", side="SELL", target_exposure_bp=0)
+    assert tuple(seeded.conn.execute(
+        "SELECT side, target_exposure_bp FROM paper_order_proposals WHERE proposal_id='prop-exit'"
+    ).fetchone()) == ("SELL", 0)
+
+
+@pytest.mark.parametrize("target", [-1, 10001, 1.5, True])
+def test_proposal_target_boundaries_rejected(seeded: PaperLedger, target) -> None:
+    seed_decision(seeded, f"dec-target-{target}")
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        seed_proposal(seeded, f"prop-target-{target}", f"dec-target-{target}", target_exposure_bp=target)
 
 
 def test_reject_review_schema_constraints(seeded: PaperLedger) -> None:
@@ -1045,6 +1229,29 @@ def test_causal_time_kill_switch_events_monotonic(seeded: PaperLedger) -> None:
         )
 
 
+@pytest.mark.parametrize("event_at", [
+    "2026-08-06T00:00:00+00:00",
+    "2026-08-06T09:00:00",
+    "not-a-timestamp",
+])
+@pytest.mark.parametrize("kind", ["account", "kill"])
+def test_public_authoritative_state_append_requires_explicit_kst(
+    ledger: PaperLedger, event_at: str, kind: str,
+) -> None:
+    seed_account(ledger)
+    with pytest.raises(ValueError, match=r"explicit \+09:00"):
+        if kind == "account":
+            ledger.append_account_event(
+                account_event_id="state-bad", account_id="acct-1",
+                event_type="ENABLED", reason_code="MANUAL", event_at=event_at,
+            )
+        else:
+            ledger.append_kill_switch_event(
+                kill_switch_event_id="state-bad", account_id="acct-1",
+                event_type="RELEASED", reason_code="MANUAL", event_at=event_at,
+            )
+
+
 def test_causal_time_order_events_monotonic(seeded: PaperLedger) -> None:
     seed_order_chain(seeded, "t5")
     with pytest.raises(sqlite3.IntegrityError):  # 주문 생성 이전 시각
@@ -1066,14 +1273,14 @@ def test_buy_fill_requires_sufficient_derived_cash(seeded: PaperLedger) -> None:
 
 
 def test_sell_fill_requires_sufficient_derived_shares(seeded: PaperLedger) -> None:
-    seed_order_chain(seeded, "over", action="SELL", quantity=11)  # 보유는 10주뿐
+    seed_order_chain(seeded, "over", action="EXIT", quantity=11)  # 보유는 10주뿐
     with pytest.raises(sqlite3.IntegrityError):
         seed_fill(seeded, fill_id="fill-over", order_id="ord-over", quantity=11)
     assert seeded.positions("acct-1") == {"005930": 10}
 
 
 def test_sell_fill_within_held_shares_succeeds(seeded: PaperLedger) -> None:
-    seed_order_chain(seeded, "sok", action="SELL", quantity=10)
+    seed_order_chain(seeded, "sok", action="EXIT", quantity=10)
     seed_fill(seeded, fill_id="fill-sok", order_id="ord-sok", quantity=10, fee_krw=105, tax_krw=1_260)
     assert seeded.positions("acct-1") == {}
     assert seeded.cash_balance("acct-1") == 9_299_895 + 700_000 - 105 - 1_260
