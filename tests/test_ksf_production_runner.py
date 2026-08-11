@@ -133,6 +133,41 @@ def test_optional_global_failure_is_nonfatal_and_boundaries_are_not_activated(tm
     assert all("missing_required" in item and "missing_optional" in item for item in summary["symbols"])
 
 
+def test_complete_run_persists_exact_deterministic_scoring_lineage(tmp_path):
+    from strategy.paper_source import load_ksf_sqlite
+
+    summary = run_fake(tmp_path)
+    db = tmp_path / "ledger" / "ksf.sqlite3"
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        decisions = conn.execute(
+            "SELECT * FROM ksf_decisions ORDER BY symbol,horizon_days"
+        ).fetchall()
+        runs = conn.execute(
+            "SELECT * FROM ksf_runs WHERE scoring_ruleset_version='ksf-deterministic-v1' ORDER BY symbol"
+        ).fetchall()
+    assert len(decisions) == 6
+    assert {(row["symbol"], row["horizon_days"]) for row in decisions} == {
+        (symbol, horizon) for symbol in ("005930", "000660") for horizon in (1, 5, 20)
+    }
+    assert len(runs) == 2 and all(row["run_status"] == "SCORING_DONE" for row in runs)
+    assert all(row["scoring_ruleset_version"] == "ksf-deterministic-v1" for row in runs)
+    assert all(row["scoring_ruleset_version"] == "ksf-deterministic-v1" for row in decisions)
+    assert all(len(row["feature_snapshot_sha256"]) == 64 for row in decisions)
+    assert all(json.loads(row["feature_contributions_json"]) for row in decisions)
+    assert all("secret" not in row["rationale_json"].lower() for row in decisions)
+    source_sha = hashlib.sha256(db.read_bytes()).hexdigest()
+    lineages, observations = load_ksf_sqlite(
+        db.resolve(), session_id=AS_OF.date().isoformat(), horizon_days=5,
+        cycle_at=summary["as_of_kst"], source_sha256=source_sha,
+    )
+    assert {item.symbol for item in lineages} == {"005930", "000660"}
+    assert {item.symbol for item in observations} == {"005930", "000660"}
+    assert {item.feature_snapshot_sha256 for item in lineages} == {
+        row["feature_snapshot_sha256"] for row in decisions if row["horizon_days"] == 5
+    }
+
+
 def test_default_domestic_dependency_uses_latest_xkrx_session_strictness(monkeypatch):
     import ksf.production_runner as production_runner
 
@@ -287,6 +322,11 @@ def test_feature_gate_fails_when_supported_symbol_has_missing_or_stale_required(
 
     assert rc != 0
     assert json.loads(capsys.readouterr().out) == {"status": "failed", "failed_stage": "feature_gate"}
+    with sqlite3.connect(tmp_path / "ledger.sqlite3") as conn:
+        assert conn.execute("SELECT count(*) FROM ksf_decisions").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM ksf_runs WHERE run_status='SCORING_DONE'"
+        ).fetchone()[0] == 0
 
 
 def test_runner_fails_closed_when_ordered_upgrade_migration_is_missing(tmp_path, capsys):

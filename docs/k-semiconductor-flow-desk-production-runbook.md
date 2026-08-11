@@ -2,14 +2,61 @@
 
 This repository supplies deployment artifacts only. Do not run these commands
 until production change approval and a credential review are complete. The
-runner collects read-only market data for `005930` and `000660`; it never calls
-an AI provider or performance settlement. Those stages report
+runner collects read-only market data for `005930` and `000660`, materializes a
+canonical scoring run, and writes deterministic 1/5/20-day decisions. It never
+calls an AI provider or performance settlement. Those stages report
 `not_activated`. KIS observations remain `INTRADAY_ESTIMATE`, including on the
 post-close schedule, because they are not an official close provider.
 
 The dashboard service is not installed. It remains out of scope until
 `KSF_READ_TOKEN` is approved; bearer authentication must not be bypassed or
 weakened.
+
+## Paper-agent release boundary
+
+The paper agent is a distinct, disabled-by-default release. Apply migrations
+`001` then `002` to the production KSF SQLite database through the approved
+KSF runner release procedure; do not hand-edit schema rows. Before release,
+back up both KSF and paper databases with SQLite `.backup`, record file hashes,
+and verify schema versions `1` and `2`, `integrity_check=ok`, and an empty
+`foreign_key_check` result.
+
+Install the wrapper and service template only after review. The wrapper derives
+one KST `SESSION_ID` and `CYCLE_AT`, selects exactly
+`$PAPER_AGENT_BUNDLE_DIR/YYYY-MM-DD.json`, rejects missing files and symlinks,
+and passes all content validation to `strategy.paper_cycle` before the paper DB
+is opened. The immutable bundle must use `ksf-response-bundle-v1`, contain only
+symbol-keyed normalized responses, and bind its own hash to the session, cycle,
+KSF file hash, model identity, run ID, decision ID, and feature snapshot hash.
+Never place raw provider payloads, prompts, credentials, headers, or tokens in
+the bundle.
+
+For the first smoke, keep `PAPER_AGENT_ENABLED=false` and confirm the bounded
+`paper-cycle status=disabled` output. Then, under an approved maintenance
+window, use `PAPER_AGENT_ENABLED=true`, `PAPER_AGENT_MODE=shadow`, and leave
+`PAPER_AGENT_FILLS_ENABLED=false`. A successful shadow smoke must show exactly
+two exact-session lineages, no missing/stale required feature, matching hashes,
+one exact configured-horizon decision per symbol, a committed paper cycle, and
+zero paper orders/fills. Do not enable the unit or timer as part of the smoke.
+
+Fills are a separate change: `PAPER_AGENT_MODE=fills` is insufficient unless
+`PAPER_AGENT_FILLS_ENABLED=true` is also explicitly approved. Internal fills
+and shadow operation must never share an enable switch.
+
+Monitor only bounded metadata: service result, session, mode, decision counts,
+replay status, SQLite integrity/foreign-key results, KSF run freshness, bundle
+age, and hash-match failures. Alert on a missing exact-session run, duplicate
+horizon, stale/partial bundle, provenance mismatch, unexpected replay, any
+paper order/fill in shadow, or journal output containing payload-like data.
+Do not log response bodies or environment values.
+
+To roll back, disable the paper unit/timer first, restore the reviewed prior
+service and wrapper artifacts, and retain the failed databases and bundle as
+restricted audit evidence. Restore a database only from the pre-release SQLite
+backup during a maintenance window; verify hashes and integrity before any
+restart. Keep both paper enable flags false until root cause and provenance are
+reviewed. KSF collection can remain active if its own integrity and scoring
+checks pass; paper-agent rollback does not authorize changing the KSF timer.
 
 ## Zero-gap cutover rule
 

@@ -423,10 +423,7 @@ def run_cycle_from_env(env: Mapping[str, str], *, ledger_factory=PaperLedger,
             1024 * 1024 * 1024, retain=False)
         if raw is None:
             raise LedgerError("enabled response bundle bytes are unavailable")
-        bundle = json.loads(raw.decode("utf-8"))
-        if type(bundle) is not dict or set(bundle) != set(SUPPORTED_SYMBOLS) or any(type(v) is not dict for v in bundle.values()):
-            raise ValueError
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         raise LedgerError("enabled runtime artifacts are unavailable or malformed") from exc
     loader = source_loader
     if loader is None:
@@ -435,7 +432,15 @@ def run_cycle_from_env(env: Mapping[str, str], *, ledger_factory=PaperLedger,
     lineages, observations = loader(paths["PAPER_AGENT_KSF_DB_PATH"],
         session_id=env["PAPER_AGENT_SESSION_ID"], horizon_days=horizon,
         cycle_at=env["PAPER_AGENT_CYCLE_AT"], source_sha256=source_sha)
-    transport = lambda request: bundle[request["symbol"]]
+    from ksf.response_bundle import validate_response_bundle
+    lineage_map = {item.symbol: {"ksf_run_id": item.ksf_run_id,
+        "ksf_decision_id": item.ksf_decision_id,
+        "feature_snapshot_sha256": item.feature_snapshot_sha256} for item in lineages}
+    responses = validate_response_bundle(raw, session_id=env["PAPER_AGENT_SESSION_ID"],
+        cycle_at=env["PAPER_AGENT_CYCLE_AT"], source_artifact_sha256=source_sha,
+        lineage=lineage_map, model_provider=env["PAPER_AGENT_MODEL_PROVIDER"],
+        model_name=env["PAPER_AGENT_MODEL_NAME"])
+    transport = lambda request: responses[request["symbol"]]
     config = CycleConfig(env["PAPER_AGENT_MODE"], paths["PAPER_AGENT_DB_PATH"],
         env["PAPER_AGENT_ACCOUNT_ID"], paths["PAPER_AGENT_LOCK_PATH"], "ksf-sqlite", risk, execution)
     data = CycleInput(env["PAPER_AGENT_SESSION_ID"], env["PAPER_AGENT_CYCLE_AT"],

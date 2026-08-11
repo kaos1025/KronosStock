@@ -27,6 +27,7 @@ from inference.k_semiconductor_domestic_price_collector import (
 from ksf.feature_engine import FeatureEngine
 from ksf.global_collector import collect_global_inputs, stable_json
 from ksf.ledger_lock import DEFAULT_TIMEOUT_SECONDS, LedgerLockError, acquire_writer_lock
+from ksf.scoring import SCORING_RULESET_VERSION, persist_scoring
 
 
 KST = timezone(timedelta(hours=9))
@@ -228,6 +229,10 @@ def _run_once_locked(path: Path, deps: RunnerDependencies) -> dict[str, Any]:
             for symbol in SUPPORTED_SYMBOLS
         ):
             raise StageFailure("feature_gate")
+        try:
+            inserted_decisions = persist_scoring(conn, trading_date=trading_date, outputs=outputs)
+        except Exception as exc:
+            raise StageFailure("scoring") from exc
         integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
         foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
         if integrity != "ok" or foreign_key_errors:
@@ -242,6 +247,8 @@ def _run_once_locked(path: Path, deps: RunnerDependencies) -> dict[str, Any]:
                 "domestic_price": _domestic_counts(domestic_price_result),
                 "global": _global_counts(global_results),
                 "feature_engine": {"status": "ok", "symbols": len(outputs)},
+                "scoring": {"status": "ok", "inserted_decisions": inserted_decisions,
+                            "ruleset_version": SCORING_RULESET_VERSION},
                 "ai_explanation": {"status": "not_activated"},
                 "performance_settlement": {"status": "not_activated"},
             },

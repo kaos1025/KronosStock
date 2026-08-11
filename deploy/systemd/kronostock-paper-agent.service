@@ -9,7 +9,8 @@ User=deploy
 Group=deploy
 WorkingDirectory=/srv/agent-workspaces/KronosStock
 EnvironmentFile=/etc/kronostock/paper-agent.env
-ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once
+ExecStart=/srv/agent-workspaces/KronosStock/scripts/deploy/kronostock-paper-agent-once.sh
+# Wrapper final handoff (legacy contract): ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once
 TimeoutStartSec=300
 NoNewPrivileges=true
 PrivateTmp=true
@@ -22,5 +23,5 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 UMask=0077
-# External response-bundle generation is a separate approval-gated adapter.
+# External response-bundle generation remains a separate approval-gated adapter; the wrapper validates its daily immutable output.
 # Telegram delivery is a separate approval-gated adapter; this unit has no network path.

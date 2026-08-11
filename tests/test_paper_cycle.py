@@ -4,7 +4,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -136,10 +138,64 @@ def _runtime_env(tmp_path, paper, ksf, bundle):
         "PAPER_AGENT_RESPONSE_BUNDLE_PATH":str(bundle)}
 
 
+def _write_bundle(path, ksf):
+    from ksf.response_bundle import build_response_bundle
+    lineage = {symbol: {"ksf_run_id": "run-" + symbol,
+        "ksf_decision_id": "ksf-" + symbol,
+        "feature_snapshot_sha256": hashlib.sha256(_snapshot(symbol).stable_json().encode()).hexdigest()}
+        for symbol in ("005930", "000660")}
+    source_sha = hashlib.sha256(ksf.read_bytes()).hexdigest() if ksf.exists() else "d" * 64
+    value = build_response_bundle(session_id="2026-08-08", cycle_at=NOW,
+        source_artifact_sha256=source_sha, lineage=lineage,
+        responses={symbol: {} for symbol in lineage}, model_provider="offline", model_name="fixture-v1")
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def test_response_bundle_is_immutable_versioned_and_lineage_bound(tmp_path):
+    from ksf.response_bundle import build_response_bundle, validate_response_bundle
+
+    lineage = {
+        symbol: {"ksf_run_id": "run-" + symbol, "ksf_decision_id": "ksf-" + symbol,
+                 "feature_snapshot_sha256": ("a" if symbol == "005930" else "b") * 64}
+        for symbol in ("005930", "000660")
+    }
+    responses = {symbol: {"action": "HOLD", "target_exposure_pct": 0,
+        "confidence": 0.5, "thesis": "검증된 오프라인 응답", "evidence": [],
+        "data_gaps": [], "abstain_reason": None} for symbol in lineage}
+    bundle = build_response_bundle(session_id="2026-08-08", cycle_at=NOW,
+        source_artifact_sha256="d" * 64, lineage=lineage, responses=responses,
+        model_provider="offline", model_name="fixture-v1")
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    accepted = validate_response_bundle(path.read_bytes(), session_id="2026-08-08",
+        cycle_at=NOW, source_artifact_sha256="d" * 64, lineage=lineage,
+        model_provider="offline", model_name="fixture-v1")
+    assert accepted == responses
+
+    mutations = [
+        lambda value: value.update(schema_version="wrong"),
+        lambda value: value.update(session_id="2026-08-07"),
+        lambda value: value.update(cycle_at="2026-08-08T09:59:59+09:00"),
+        lambda value: value.update(source_artifact_sha256="e" * 64),
+        lambda value: value["symbols"].pop("000660"),
+        lambda value: value["symbols"]["005930"].update(ksf_run_id="wrong"),
+        lambda value: value["symbols"]["005930"].update(ksf_decision_id="wrong"),
+        lambda value: value["symbols"]["005930"].update(feature_snapshot_sha256="f" * 64),
+        lambda value: value.update(bundle_sha256="0" * 64),
+    ]
+    for mutate in mutations:
+        changed = json.loads(json.dumps(bundle))
+        mutate(changed)
+        with pytest.raises(LedgerError):
+            validate_response_bundle(json.dumps(changed).encode(), session_id="2026-08-08",
+                cycle_at=NOW, source_artifact_sha256="d" * 64, lineage=lineage,
+                model_provider="offline", model_name="fixture-v1")
+
+
 def test_env_runtime_loads_read_only_source_and_persists_real_shadow_cycle(tmp_path):
     paper, ksf, bundle = tmp_path/"paper.sqlite3", tmp_path/"ksf.sqlite3", tmp_path/"bundle.json"
     _seed_account(paper); _ksf_db(ksf)
-    bundle.write_text(json.dumps({"005930":{}, "000660":{}}))
+    _write_bundle(bundle, ksf)
     result = run_cycle_from_env(_runtime_env(tmp_path, paper, ksf, bundle))
     assert result.committed and result.counts["decisions"] == 2
     with PaperLedger(paper) as ledger:
@@ -148,7 +204,7 @@ def test_env_runtime_loads_read_only_source_and_persists_real_shadow_cycle(tmp_p
 
 def test_invalid_source_status_precedes_lock_and_paper_ledger_mutation(tmp_path):
     paper, ksf, bundle = tmp_path/"absent.sqlite3", tmp_path/"ksf.sqlite3", tmp_path/"bundle.json"
-    _ksf_db(ksf, status="PARTIAL_DATA"); bundle.write_text(json.dumps({"005930":{}, "000660":{}}))
+    _ksf_db(ksf, status="PARTIAL_DATA"); _write_bundle(bundle, ksf)
     with pytest.raises(LedgerError, match="eligible exact-session"):
         run_cycle_from_env(_runtime_env(tmp_path, paper, ksf, bundle))
     assert not paper.exists() and not (tmp_path/"paper.lock").exists()
@@ -157,7 +213,7 @@ def test_invalid_source_status_precedes_lock_and_paper_ledger_mutation(tmp_path)
 @pytest.mark.parametrize("corruption", ["cross-symbol", "future-optional"])
 def test_source_rejects_hidden_cross_symbol_and_future_rows_before_paper_mutation(tmp_path, corruption):
     paper, ksf, bundle = tmp_path/"absent.sqlite3", tmp_path/"ksf.sqlite3", tmp_path/"bundle.json"
-    _ksf_db(ksf); bundle.write_text(json.dumps({"005930":{}, "000660":{}}))
+    _ksf_db(ksf); _write_bundle(bundle, ksf)
     conn = sqlite3.connect(ksf)
     if corruption == "cross-symbol":
         conn.execute("UPDATE ksf_normalized_features SET symbol='000660' WHERE run_id='run-005930' AND feature_name='volume'")
@@ -192,11 +248,28 @@ def test_fills_env_requires_explicit_fills_gate_before_any_runtime_access(tmp_pa
     assert touched == []
 
 
+def test_one_shot_wrapper_is_disabled_by_default_and_keeps_fill_gate_separate(tmp_path):
+    wrapper = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "kronostock-paper-agent-once.sh"
+    disabled = subprocess.run([str(wrapper)], env={"PATH": os.environ["PATH"]},
+        text=True, capture_output=True, check=False)
+    assert disabled.returncode == 0 and disabled.stdout == "paper-cycle status=disabled\n"
+    fills = subprocess.run([str(wrapper)], env={"PATH": os.environ["PATH"],
+        "PAPER_AGENT_ENABLED": "true", "PAPER_AGENT_MODE": "fills"},
+        text=True, capture_output=True, check=False)
+    assert fills.returncode != 0 and fills.stderr == "paper-cycle status=failed\n"
+    source = wrapper.read_text()
+    assert 'bundle_path="${PAPER_AGENT_BUNDLE_DIR%/}/${session_id}.json"' in source
+    assert 'export PAPER_AGENT_SESSION_ID="${session_id}"' in source
+    assert 'export PAPER_AGENT_CYCLE_AT="${cycle_at}"' in source
+    assert '[[ -f "${bundle_path}" && ! -L "${bundle_path}" ]]' in source
+    assert source.index('[[ -f "${bundle_path}"') < source.index("exec /srv/agent-workspaces")
+
+
 @pytest.mark.parametrize("missing", ["bundle", "source"])
 def test_enabled_runtime_missing_artifact_is_failed_not_disabled(tmp_path, monkeypatch, capsys, missing):
     ksf, bundle = tmp_path/"ksf.sqlite3", tmp_path/"bundle.json"
     if missing != "source": _ksf_db(ksf)
-    if missing != "bundle": bundle.write_text(json.dumps({"005930":{}, "000660":{}}))
+    if missing != "bundle": _write_bundle(bundle, ksf)
     env = _runtime_env(tmp_path, tmp_path/"paper.sqlite3", ksf, bundle)
     monkeypatch.setattr("strategy.paper_cycle.os.environ", env)
     assert main(["--once"]) == 1
@@ -208,7 +281,7 @@ def test_enabled_runtime_missing_artifact_is_failed_not_disabled(tmp_path, monke
 def test_source_artifact_hash_is_exact_file_bytes_and_passed_to_loader(tmp_path):
     paper, ksf, bundle = tmp_path/"paper.sqlite3", tmp_path/"ksf.sqlite3", tmp_path/"bundle.json"
     _seed_account(paper); _ksf_db(ksf)
-    bundle.write_text(json.dumps({"005930":{}, "000660":{}}))
+    _write_bundle(bundle, ksf)
     seen = []
     from strategy.paper_source import load_ksf_sqlite
     def loader(path, **kwargs):
