@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
@@ -180,10 +181,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m bot.scheduler",
         description="KronosStock dry-run 자동화 runner (실주문 API 호출 없음).",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once",
         action="store_true",
         help="스케줄러를 띄우지 않고 dry-run 사이클을 1회만 실행하고 종료.",
+    )
+    mode.add_argument(
+        "--paper-agent-once",
+        action="store_true",
+        help="별도 event-sourced paper agent를 명시적으로 1회 실행(env gate 필수).",
     )
     parser.add_argument(
         "--send-alert",
@@ -204,6 +211,8 @@ def main(argv: Sequence[str] | None = None) -> DryRunResult | BackgroundSchedule
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
+    if args.paper_agent_once:
+        return run_paper_agent_once()
     if args.once:
         result = run_dry_run_cycle(send_alert=args.send_alert)
         print(result.message)
@@ -211,6 +220,13 @@ def main(argv: Sequence[str] | None = None) -> DryRunResult | BackgroundSchedule
             print("portfolio ->", result.portfolio_key)
         return result
     return run_service(send_alert=args.send_alert)
+
+
+def run_paper_agent_once():
+    """Lazy bridge only; generic scheduler startup never imports/runs Task 6."""
+    from strategy.paper_cycle import run_cycle_from_env
+
+    return run_cycle_from_env(os.environ)
 
 
 def load_paper_portfolio(*, default: PaperPortfolio | None = None) -> PaperPortfolio:

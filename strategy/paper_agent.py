@@ -80,7 +80,7 @@ from ksf.feature_engine import (
 from ksf.global_collector import stable_id, stable_json
 
 
-RESPONSE_SCHEMA_VERSION = "kronos-paper-proposal-v1"
+RESPONSE_SCHEMA_VERSION = "kronos-paper-proposal-v2"
 PROMPT_TEMPLATE_VERSION = "kronos-paper-proposal-prompt-v1"
 MODEL_POLICY_VERSION = "kronos-paper-single-symbol-policy-v1"
 
@@ -145,12 +145,14 @@ MODEL_ABSTAIN_REASONS = frozenset({"NO_EDGE"})
 
 ABSTAIN_REASONS = DATA_ABSTAIN_REASONS | MODEL_FAILURE_ABSTAIN_REASONS | MODEL_ABSTAIN_REASONS
 
-#: Exact closed holdings schema for the current symbol only.
+#: Exact closed holdings schema separating the current symbol from the rest of
+#: the authoritative portfolio value.
 HOLDINGS_KEYS = (
     "symbol",
     "cash_krw",
     "quantity",
     "market_value_krw",
+    "other_position_value_krw",
     "total_equity_krw",
     "current_exposure_pct",
 )
@@ -164,7 +166,6 @@ POLICY_LIMIT_KEYS = ("max_target_exposure_pct",)
 DATA_GAP_ITEM_KEYS = ("feature_name", "feature_group", "status", "as_of", "text", "evidence_ids")
 
 _SHA256_LOWER_HEX = re.compile(r"[0-9a-f]{64}")
-_EQUITY_TOLERANCE_KRW = 0.5
 _EXPOSURE_TOLERANCE_PCT = 0.1
 _PCT_TOLERANCE = 1e-9
 
@@ -319,11 +320,15 @@ def _sanitize_holdings(holdings: Any, symbol: str) -> dict[str, Any]:
     quantity = holdings["quantity"]
     if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0:
         raise ValueError("holdings quantity must be a nonnegative integer")
+    other_position_value = holdings["other_position_value_krw"]
+    if (isinstance(other_position_value, bool)
+            or not isinstance(other_position_value, int) or other_position_value < 0):
+        raise ValueError("holdings other_position_value_krw must be a nonnegative integer")
     total = numeric["total_equity_krw"]
     if total <= 0:
         raise ValueError("holdings total_equity_krw must be positive")
-    if abs(numeric["cash_krw"] + numeric["market_value_krw"] - total) > _EQUITY_TOLERANCE_KRW:
-        raise ValueError("holdings cash_krw plus market_value_krw must equal total_equity_krw")
+    if numeric["cash_krw"] + numeric["market_value_krw"] + other_position_value != total:
+        raise ValueError("holdings cash, current market value, and other position value must equal total equity")
     if (quantity == 0) != (numeric["market_value_krw"] == 0):
         raise ValueError("holdings quantity and market_value_krw must be jointly zero or positive")
     expected_exposure = numeric["market_value_krw"] / total * 100.0
@@ -334,6 +339,7 @@ def _sanitize_holdings(holdings: Any, symbol: str) -> dict[str, Any]:
         "cash_krw": numeric["cash_krw"],
         "quantity": quantity,
         "market_value_krw": numeric["market_value_krw"],
+        "other_position_value_krw": other_position_value,
         "total_equity_krw": numeric["total_equity_krw"],
         "current_exposure_pct": numeric["current_exposure_pct"],
     }

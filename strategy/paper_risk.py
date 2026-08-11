@@ -449,7 +449,9 @@ def review_and_persist(ledger: Any, *, proposal_id: str, reviewed_at: str,
             nav_row = ledger.conn.execute(
                 "SELECT * FROM paper_nav_snapshots WHERE account_id=? AND session_date=? "
                 "AND julianday(snapshot_at)<=julianday(?) "
-                "ORDER BY snapshot_at DESC, nav_snapshot_id DESC LIMIT 1",
+                "ORDER BY snapshot_at DESC, "
+                "CASE WHEN nav_snapshot_id LIKE 'paper-cycle-%:nav' THEN 1 ELSE 0 END DESC, "
+                "nav_snapshot_id DESC LIMIT 1",
                 (request.account_id, request.session_id, reviewed_at)).fetchone()
             if nav_row is None:
                 raise LedgerConflictError("authoritative current NAV snapshot is required")
@@ -528,7 +530,9 @@ def review_and_persist(ledger: Any, *, proposal_id: str, reviewed_at: str,
             history = ledger.conn.execute(
                 "SELECT session_date, cash_krw, position_value_krw, position_marks_json, nav_krw, snapshot_at FROM paper_nav_snapshots "
                 "WHERE account_id=? AND session_date<=? "
-                "ORDER BY session_date, snapshot_at, nav_snapshot_id",
+                "ORDER BY session_date, snapshot_at, "
+                "CASE WHEN nav_snapshot_id LIKE 'paper-cycle-%:nav' THEN 1 ELSE 0 END, "
+                "nav_snapshot_id",
                 (request.account_id, request.session_id)).fetchall()
             historical_navs: list[tuple[str, int]] = []
             for history_row in history:

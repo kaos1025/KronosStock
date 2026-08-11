@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
+import threading
 from functools import wraps
 from contextlib import contextmanager
 from datetime import datetime
@@ -22,6 +23,7 @@ from typing import Any, Iterator, Mapping
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 MIGRATION_001 = MIGRATIONS_DIR / "001_autonomous_paper_trading_ledgers.sql"
+_MIGRATION_LOCK = threading.Lock()
 
 SUPPORTED_SYMBOLS = frozenset({"005930", "000660"})
 AGENT_ACTIONS = frozenset({"ENTER", "HOLD", "REDUCE", "EXIT", "ABSTAIN"})
@@ -123,7 +125,10 @@ class PaperLedger:
         self.conn.isolation_level = None  # 명시적 BEGIN IMMEDIATE 로만 트랜잭션 제어
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA busy_timeout = 5000")
-        self.conn.executescript(MIGRATION_001.read_text(encoding="utf-8"))
+        # The canonical migration recreates triggers. Serialize that DDL among
+        # same-process workers before execution transactions contend normally.
+        with _MIGRATION_LOCK:
+            self.conn.executescript(MIGRATION_001.read_text(encoding="utf-8"))
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._savepoint_seq = 0
 
@@ -427,12 +432,23 @@ class PaperLedger:
         self, *, fill_id: str, order_id: str, fill_price_krw: int, quantity: int,
         fee_krw: int, tax_krw: int, slippage_krw: int,
         observed_at: str, observation_sha256: str, filled_at: str,
+        raw_reference_price_krw: int | None = None, fee_bps: int = 0,
+        tax_bps: int = 0, slippage_bps: int = 0,
+        execution_policy_sha256: str | None = None,
     ) -> str:
+        if raw_reference_price_krw is None:
+            raw_reference_price_krw = fill_price_krw
+        if execution_policy_sha256 is None:
+            execution_policy_sha256 = observation_sha256
+        _require_int("raw_reference_price_krw", raw_reference_price_krw, minimum=1)
         _require_int("fill_price_krw", fill_price_krw, minimum=1)
         _require_int("quantity", quantity, minimum=1)
         _require_int("fee_krw", fee_krw, minimum=0)
         _require_int("tax_krw", tax_krw, minimum=0)
         _require_int("slippage_krw", slippage_krw, minimum=0)
+        _require_int("fee_bps", fee_bps, minimum=0)
+        _require_int("tax_bps", tax_bps, minimum=0)
+        _require_int("slippage_bps", slippage_bps, minimum=0)
         order = self._fetch_row("paper_orders", "order_id", order_id)
         if order is None:
             raise LedgerError(f"unknown order_id {order_id!r}")
@@ -444,11 +460,17 @@ class PaperLedger:
             "account_id": order["account_id"],
             "symbol": order["symbol"],
             "side": order["side"],
+            "raw_reference_price_krw": raw_reference_price_krw,
             "fill_price_krw": fill_price_krw,
             "quantity": quantity,
             "fee_krw": fee_krw,
             "tax_krw": tax_krw,
             "slippage_krw": slippage_krw,
+            "fee_bps": fee_bps,
+            "tax_bps": tax_bps,
+            "slippage_bps": slippage_bps,
+            "execution_policy_sha256": _require_sha256(
+                "execution_policy_sha256", execution_policy_sha256),
             "observed_at": _require_tz_iso("observed_at", observed_at),
             "observation_sha256": _require_sha256("observation_sha256", observation_sha256),
             "filled_at": _require_tz_iso("filled_at", filled_at),

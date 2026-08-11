@@ -144,6 +144,52 @@ make eval                     # 단발 측정(리포트만, 영속화 X)
 
 `/paper/portfolio` 는 scheduler 와 동일 키(`kronos:stock:paper:portfolio`)의 현금·보유수량·체결기록만 반환한다.
 
+## 이벤트 소싱 자율 paper runtime (Task 1–8)
+
+이 런타임은 아래의 기존 Redis scheduler dry-run과 별개다. 전용 SQLite 원장에 KSF
+근거 lineage, agent 결정, 주문 제안, risk review와 paper 경제 이벤트를 append-only로
+기록한다. 전용 DB migration은
+`paper_trading/migrations/001_autonomous_paper_trading_ledgers.sql`이며, KSF migration
+003이 아니다.
+
+모든 실행 gate는 기본 비활성화다. `shadow`는 결정·제안·risk review까지만 허용하며,
+simulated order/fill과 현금·포지션 등 경제 상태 변경은 반드시 0이어야 한다. 이후의
+내부 paper fill도 별도 사용자 승인이 있어야 하며 로컬 replay나 readiness 결과가 mode,
+환경변수, timer를 변경하거나 자동 활성화하지 않는다. 실제 주문 또는 KIS
+virtual/live 주문 adapter는 제공하지 않는다.
+
+안전한 로컬 evidence replay는 외부 입력을 immutable record로 만들어 순수 함수에
+전달한다. import와 평가는 파일, DB, 네트워크 및 broker를 사용하지 않는다.
+
+```python
+from strategy.paper_evaluation import EvaluationConfig, evaluate_replay
+
+# persisted_decisions와 later_market_outcomes는 호출자가 검증 가능한 로컬 evidence로 구성한다.
+report = evaluate_replay(persisted_decisions, later_market_outcomes, EvaluationConfig())
+print(report.report_sha256, report.completed_sessions, report.user_approval_required)
+```
+
+Replay는 동일한 next-session timing과 비용 가정으로 deployed signal을 no-action,
+seeded deterministic random, 단순 flow/momentum baseline과 비교한다. 이는 로컬 evidence일
+뿐 수익성을 뜻하지 않는다. probability calibration/Brier는 `NOT_EVALUATED`, reliability는
+`NOT_ESTABLISHED`다. 고유한 execution/observation session 20개 이상은 필요한 evidence
+threshold일 뿐 충분조건이 아니며, 로컬 replay만으로 strategy validity가 확립되거나
+readiness가 true가 되지 않는다. 독립 review, 검증된 shadow 운영, 명시적인 사용자 승인은
+각각 별도의 gate다. 사용자 승인은 계속 필수이며 평가는 activation을 수행하지 않는다.
+
+Task 1–8 구성은 다음과 같다.
+
+- `strategy/paper_source.py`: read-only KSF source snapshot과 lineage
+- `paper_trading/ledger.py`, `paper_trading/migrations/001_autonomous_paper_trading_ledgers.sql`: 전용 append-only paper ledger
+- `strategy/paper_agent.py`: schema-bound agent decision/proposal
+- `strategy/paper_risk.py`: deterministic risk review와 승인 제한
+- `strategy/paper_broker.py`: broker와 연결되지 않는 deterministic simulated execution
+- `strategy/paper_cycle.py`: disabled-by-default shadow/fills cycle orchestration
+- `strategy/paper_web_api.py`: sanitized read-only paper evidence view
+- `strategy/paper_evaluation.py`: offline deterministic replay, baselines, readiness/shadow audit
+- `deploy/systemd/kronostock-paper-agent.service`, `deploy/systemd/kronostock-paper-agent.timer`: 명시적 gate를 유지하는 운영 wrapper
+- 대응 테스트: `tests/test_paper_*`와 `tests/test_paper_trading_ledger_migration.py`
+
 ## 자동화 dry-run 러너 (scheduler)
 `bot/scheduler.py` 는 **forecast → signal → paper order → digest** 를 1회 수행하는 안전한 자동화다.
 **실제 KIS/broker 주문 API 는 호출하지 않으며**, CLI 기본 실행은 Telegram 전송을 `--send-alert` opt-in 으로 둔다.
@@ -182,12 +228,19 @@ inference/   predictor.py · kr_data_fetcher.py · forecast_runner.py (구현됨
              vendor_kronos.sh (Kronos model/ vendoring 스크립트)
 strategy/    analyzer.py · backtester.py · paper_trader.py (구현됨)
              evaluator.py · loop.py (walk-forward 평가 + 최적화 루프, 구현됨)
+             paper_source.py · paper_agent.py · paper_risk.py · paper_broker.py
+             paper_cycle.py · paper_web_api.py · paper_evaluation.py (자율 paper Task 1–8)
+paper_trading/ ledger.py · migrations/001_autonomous_paper_trading_ledgers.sql
 bot/         alert_bot.py · scheduler.py (dry-run runner, 구현됨)
 dashboard/   app.py  ← 헬스/상태 + forecast/signal/paper 조회 (구현됨)
 common/      config.py, redis_client.py  (구현됨)
 tests/       test_forecast_runner.py · test_toss_data_fetcher.py
              test_analyzer_paper_trader.py · test_backtester.py
              test_dashboard_and_alerts.py · test_scheduler_dry_run.py (구현됨)
+             test_paper_agent.py · test_paper_risk.py · test_paper_broker.py
+             test_paper_cycle.py · test_paper_web_api.py · test_paper_evaluation.py
+             test_paper_trading_ledger_migration.py
+deploy/systemd/ kronostock-paper-agent.service · kronostock-paper-agent.timer
 notebooks/   backtest.ipynb (예정)
 Makefile     loop-baseline / loop-try / loop-promote / loop-show / eval 타깃
 eval_runs/   baseline·candidate 지표 JSON (gitignore, 로컬 전용)

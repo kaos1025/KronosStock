@@ -196,3 +196,35 @@ def test_run_service_starts_scheduler_without_blocking_or_alert(monkeypatch):
     assert isinstance(scheduler, FakeScheduler)
     assert started["start"] == 1
     assert started["send_alert"] is False
+
+
+def test_paper_agent_once_is_separate_explicit_cli_and_env_gated(monkeypatch):
+    captured = []
+    monkeypatch.setattr(sched, "run_paper_agent_once", lambda: captured.append("paper") or "paper-result")
+    assert sched.main(["--paper-agent-once"]) == "paper-result"
+    assert captured == ["paper"]
+    with pytest.raises(SystemExit):
+        sched.main(["--once", "--paper-agent-once"])
+
+
+def test_paper_systemd_templates_are_disabled_by_default_and_dedicated():
+    root = Path(__file__).resolve().parents[1]
+    service = (root / "deploy/systemd/kronostock-paper-agent.service").read_text()
+    timer = (root / "deploy/systemd/kronostock-paper-agent.timer").read_text()
+    assert "Type=oneshot" in service
+    assert "python -m strategy.paper_cycle --once" in service
+    assert "EnvironmentFile=/etc/kronostock/paper-agent.env" in service
+    assert "User=deploy" in service and "Group=deploy" in service
+    assert "WorkingDirectory=/srv/agent-workspaces/KronosStock" in service
+    assert "ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once" in service
+    assert "TimeoutStartSec=300" in service
+    assert "ReadWritePaths=/var/lib/kronostock /run/kronostock" in service
+    assert "RestrictAddressFamilies=AF_UNIX" in service
+    assert "NoNewPrivileges=true" in service and "PrivateTmp=true" in service
+    assert "kis" not in service.lower() and "broker" not in service.lower()
+    assert "Persistent=false" in timer
+    assert "RandomizedDelaySec=0" in timer and "AccuracySec=" in timer
+    assert "Unit=kronostock-paper-agent.service" in timer
+    assert "WantedBy=" not in timer and "WantedBy=" not in service
+    assert "external response-bundle" in service.lower()
+    assert "telegram" in service.lower()

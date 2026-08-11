@@ -1,0 +1,10 @@
+# Repository template only. Disabled by default; intentionally has no [Install]/WantedBy.
+[Unit]
+Description=KronosStock isolated paper agent post-close schedule
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:10:00 Asia/Seoul
+Persistent=false
+RandomizedDelaySec=0
+AccuracySec=1s
+Unit=kronostock-paper-agent.service

@@ -194,6 +194,7 @@ def _holdings(symbol="005930", **over):
         "cash_krw": 9_000_000,
         "quantity": 10,
         "market_value_krw": 1_000_000,
+        "other_position_value_krw": 0,
         "total_equity_krw": 10_000_000,
         "current_exposure_pct": 10.0,
     }
@@ -207,6 +208,7 @@ def _flat_holdings(symbol="005930"):
         "cash_krw": 10_000_000,
         "quantity": 0,
         "market_value_krw": 0,
+        "other_position_value_krw": 0,
         "total_equity_krw": 10_000_000,
         "current_exposure_pct": 0.0,
     }
@@ -419,7 +421,7 @@ def test_transport_receives_immutable_request_with_lineage_and_sanitized_holding
     assert sent["holdings"]["cash_krw"] == 9_000_000
     assert set(sent["holdings"]) == {
         "symbol", "cash_krw", "quantity", "market_value_krw",
-        "total_equity_krw", "current_exposure_pct",
+        "other_position_value_krw", "total_equity_krw", "current_exposure_pct",
     }
     with pytest.raises(TypeError):
         sent["ksf_run_id"] = "forged"
@@ -1298,6 +1300,11 @@ def test_validate_proposal_does_not_mutate_caller_payload(ledger):
         _holdings(quantity=-1),
         _holdings(cash_krw={"amount": 1}),  # 중첩 객체
         _holdings(market_value_krw="1000000"),
+        {k: v for k, v in _holdings().items() if k != "other_position_value_krw"},
+        _holdings(other_position_value_krw=True),
+        _holdings(other_position_value_krw=-1),
+        _holdings(other_position_value_krw=1.5),
+        _holdings(other_position_value_krw="1000000"),
         _holdings(total_equity_krw=11_000_000),  # cash+mv != total
         _holdings(current_exposure_pct=50.0),  # 노출 불일치
         _holdings(quantity=0),  # 수량 0 인데 평가금액 > 0
@@ -1318,6 +1325,33 @@ def test_holdings_rejects_callable_value(ledger):
 
     with pytest.raises(ValueError):
         _request(output, _holdings(market_value_krw=lambda: 1_000_000))
+
+
+def test_holdings_accepts_exact_other_position_value_and_preserves_current_symbol_zero_equivalence(ledger):
+    output = _output(ledger)
+    request = _request(output, _holdings(
+        cash_krw=8_000_000, other_position_value_krw=1_000_000,
+    ))
+    assert request["holdings"]["other_position_value_krw"] == 1_000_000
+    with pytest.raises(ValueError):
+        _request(output, _holdings(
+            cash_krw=8_000_000, quantity=0, market_value_krw=1_000_000,
+            other_position_value_krw=1_000_000, current_exposure_pct=10.0,
+        ))
+
+
+def test_other_position_value_changes_canonical_request_binding(ledger):
+    output = _output(ledger)
+    first = _request(output)
+    second = _request(output, _holdings(
+        cash_krw=8_000_000, other_position_value_krw=1_000_000,
+    ))
+    assert first["holdings"] != second["holdings"]
+    assert first["request_binding_sha256"] != second["request_binding_sha256"]
+
+
+def test_holdings_contract_bumps_response_schema_version():
+    assert paper_agent.RESPONSE_SCHEMA_VERSION == "kronos-paper-proposal-v2"
 
 
 @pytest.mark.parametrize(

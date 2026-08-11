@@ -56,9 +56,25 @@ APPEND_ONLY_TABLES = [
     "paper_position_events",
     "paper_nav_snapshots",
     "paper_kill_switch_events",
+    "paper_cycle_commits",
 ]
 
 REQUIRED_TABLES = ["paper_schema_versions", *APPEND_ONLY_TABLES]
+
+
+def test_cycle_commit_schema_rejects_noncanonical_identity_and_counts(ledger):
+    seed_account(ledger)
+    base = ("cycle", "acct-1", "2026-08-05", "shadow", "a"*64,
+            '{"decisions":0,"proposals":0,"reviews":0,"orders":0,"fills":0}',
+            "2026-08-05T16:10:00+09:00")
+    ledger.conn.execute("INSERT INTO paper_cycle_commits VALUES(?,?,?,?,?,?,?)", base)
+    for index, changed in enumerate(((2, "2026-8-5"), (3, "live"), (4, "A"*64),
+                                      (5, "[]"), (6, "2026-08-05T16:10:00Z"))):
+        row = list(base); row[0] = f"bad-{index}"; row[changed[0]] = changed[1]
+        row[1] = f"bad-acct-{index}"
+        ledger.create_account(account_id=row[1], initial_cash_krw=1, policy_version="v", created_at=TS_CREATE)
+        with pytest.raises(sqlite3.IntegrityError):
+            ledger.conn.execute("INSERT INTO paper_cycle_commits VALUES(?,?,?,?,?,?,?)", row)
 
 
 @pytest.fixture
@@ -248,6 +264,10 @@ def seeded(ledger: PaperLedger) -> PaperLedger:
         reason_code="STARTUP_DEFAULT",
         event_at=TS_CREATE,
     )
+    ledger.conn.execute("""INSERT INTO paper_cycle_commits
+        (cycle_id,account_id,session_id,mode,payload_sha256,result_counts_json,committed_at)
+        VALUES(?,?,?,?,?,?,?)""", ("cycle-1", "acct-1", "2026-08-05", "shadow", SHA_A,
+        '{"decisions":1,"proposals":1,"reviews":1,"orders":1,"fills":1}', TS_CREATE))
     return ledger
 
 

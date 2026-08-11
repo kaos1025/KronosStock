@@ -22,6 +22,12 @@ from common.config import settings
 from common.redis_client import get_redis, key, ping as redis_ping
 from common.symbols import symbol_name
 from strategy.analyzer import analyze_forecast
+from strategy.paper_web_api import (
+    SUPPORTED_SYMBOLS as PAPER_SUPPORTED_SYMBOLS,
+    get_account as get_paper_account,
+    get_decisions as get_paper_decisions,
+    get_orders as get_paper_orders,
+)
 from ksf.web_api import get_cards, get_detail
 
 app = FastAPI(title="KronosStock", version="0.1.0")
@@ -134,6 +140,92 @@ def _require_ksf_auth(authorization: str | None = Header(default=None)) -> None:
             'Bearer realm="KronosStock KSF"'
         },
     )
+
+
+_PAPER_CSS = """
+*{box-sizing:border-box}html,body{margin:0;max-width:100%;overflow-x:hidden}
+body{font-family:system-ui,sans-serif;background:#f4f6f8;color:#17202a;line-height:1.5}
+.paper-top,.paper-main{width:min(72rem,100%);margin:auto;padding:1rem}.paper-top{background:#14213d;color:#fff}
+.paper-nav{display:flex;gap:.5rem;flex-wrap:wrap}.paper-nav a{color:#fff;min-height:44px;display:inline-flex;align-items:center;padding:.5rem .75rem}
+.paper-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}.paper-card,.paper-section{background:#fff;padding:1rem;border-radius:.6rem;box-shadow:0 1px 5px #0002}
+.paper-card strong{display:block;font-size:1.2rem}.paper-section{margin-top:1rem}.paper-table{width:100%;table-layout:fixed;border-collapse:collapse}
+.paper-table th,.paper-table td{text-align:left;padding:.6rem .25rem;overflow-wrap:anywhere}.paper-tag{display:inline-block;padding:.2rem .45rem;background:#e8eef8;color:#17202a;border-radius:1rem}
+@media(max-width:47.99rem){.paper-table thead{display:none}.paper-table,.paper-table tbody,.paper-table tr,.paper-table td{display:block}.paper-table tr{border-bottom:1px solid #d7dde5;padding:.5rem 0}.paper-table tr:last-child{border-bottom:0}.paper-table td{display:flex;justify-content:space-between;gap:1rem;padding:.45rem 0;overflow-wrap:break-word;word-break:normal}.paper-table td::before{content:attr(data-label);flex:0 0 6rem;font-weight:700;color:#465568}.paper-table td[colspan]{justify-content:flex-start}}
+@media(min-width:48rem){.paper-grid{grid-template-columns:repeat(3,1fr)}.paper-top,.paper-main{padding:1.5rem}}
+"""
+
+
+def _paper_money(value: object) -> str:
+    return f"{value:,}" if type(value) is int else "—"
+
+
+def _paper_time(value: object) -> str:
+    if not isinstance(value, str):
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return "—"
+        return parsed.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
+    except (OverflowError, TypeError, ValueError):
+        return "—"
+
+
+def _paper_document(account: dict, rows: list[dict]) -> HTMLResponse:
+    if account.get("status") == "ok":
+        kill = "해제" if account.get("kill_switch") == "released" else "작동 또는 확인 불가"
+        cards = (("계좌 NAV", account.get("nav_krw")), ("현금", account.get("cash_krw")),
+                 ("총 포지션 노출", account.get("exposure_krw")), ("초기 현금 대비 손익", account.get("pnl_krw")),
+                 ("최대 낙폭", account.get("drawdown_krw")), ("최대 낙폭 bp", account.get("drawdown_bps")))
+        cards_html = "".join(f'<article class="paper-card"><span>{html.escape(label)}</span><strong>{html.escape(_paper_money(value))}</strong></article>' for label, value in cards)
+        positions = "".join(f'<tr><td data-label="종목">{html.escape(str(p["symbol"]))}</td><td data-label="수량">{html.escape(_paper_money(p["quantity"]))}</td><td data-label="기준가">{html.escape(_paper_money(p["mark_price_krw"]))}</td><td data-label="평가액">{html.escape(_paper_money(p["value_krw"]))}</td></tr>' for p in account.get("positions", []))
+        positions = positions or '<tr><td data-label="안내" colspan="4">보유 포지션 없음</td></tr>'
+        state = f'<p class="paper-tag">안전 중지: {html.escape(kill)}</p>'
+    else:
+        cards_html = '<article class="paper-card"><strong>데이터 없음</strong><span>원장 상태를 확인할 수 없습니다.</span></article>'
+        positions = '<tr><td data-label="안내" colspan="4">데이터 없음</td></tr>'
+        state = '<p class="paper-tag">안전 중지: 작동 또는 확인 불가</p>'
+    recent = "".join(f'<tr><td data-label="종목">{html.escape(str(r.get("symbol", "—")))}</td><td data-label="판단">{html.escape(str(r.get("action_label", "확인 불가")))}</td><td data-label="상태">{html.escape(str(r.get("lifecycle_label", "확인 불가")))}</td><td data-label="시각">{html.escape(_paper_time(r.get("decided_at")))}</td></tr>' for r in rows[:10])
+    recent = recent or '<tr><td data-label="안내" colspan="4">최근 기록 없음</td></tr>'
+    legend = " · ".join(("AI 제안", "위험 검토 거절", "체결 대기", "미체결 종료", "체결 완료", "판단 보류", "조치 없음"))
+    document = f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>모의 운용 현황</title><style>{_PAPER_CSS}</style></head><body>
+<header class="paper-top"><nav class="paper-nav" aria-label="모의 운용 탐색"><a href="/paper">현황</a><a href="/paper/orders">주문 기록 JSON</a><a href="/paper/decisions/005930">005930 판단</a><a href="/paper/decisions/000660">000660 판단</a></nav><h1>모의 운용 현황</h1><p>인증된 읽기 전용 화면</p>{state}</header>
+<main class="paper-main"><section aria-labelledby="account-title"><h2 id="account-title">계좌 요약</h2><div class="paper-grid">{cards_html}</div></section>
+<section class="paper-section" aria-labelledby="positions-title"><h2 id="positions-title">보유 포지션</h2><table class="paper-table"><thead><tr><th>종목</th><th>수량</th><th>기준가</th><th>평가액</th></tr></thead><tbody>{positions}</tbody></table></section>
+<section class="paper-section" aria-labelledby="life-title"><h2 id="life-title">최근 처리 기록</h2><p>{html.escape(legend)}</p><table class="paper-table"><thead><tr><th>종목</th><th>판단</th><th>상태</th><th>시각</th></tr></thead><tbody>{recent}</tbody></table></section></main></body></html>'''
+    return HTMLResponse(document)
+
+
+@app.get("/paper", response_class=HTMLResponse)
+def paper_dashboard(_: None = Depends(_require_ksf_auth)) -> HTMLResponse:
+    account = get_paper_account()
+    orders = get_paper_orders()
+    decisions = []
+    for symbol in sorted(PAPER_SUPPORTED_SYMBOLS):
+        decisions.extend(get_paper_decisions(symbol).get("decisions", []))
+    def decision_sort_key(row: dict) -> tuple[int, datetime]:
+        try:
+            value = datetime.fromisoformat(row.get("decided_at", ""))
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError
+            return (1, value.astimezone(timezone.utc))
+        except (TypeError, ValueError):
+            return (0, datetime.min.replace(tzinfo=timezone.utc))
+
+    decisions.sort(key=decision_sort_key, reverse=True)
+    return _paper_document(account, decisions if decisions else orders.get("orders", []))
+
+
+@app.get("/paper/orders")
+def paper_orders(_: None = Depends(_require_ksf_auth)) -> dict:
+    return get_paper_orders()
+
+
+@app.get("/paper/decisions/{symbol}")
+def paper_decisions(symbol: str, _: None = Depends(_require_ksf_auth)) -> dict:
+    if symbol not in PAPER_SUPPORTED_SYMBOLS:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    return get_paper_decisions(symbol)
 
 
 @app.get("/ksf/cards")

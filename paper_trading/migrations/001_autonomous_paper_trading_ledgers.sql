@@ -254,6 +254,7 @@ CREATE TABLE IF NOT EXISTS paper_fills (
     account_id TEXT NOT NULL REFERENCES paper_accounts(account_id),
     symbol TEXT NOT NULL CHECK (symbol IN ('005930','000660')),
     side TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+    raw_reference_price_krw INTEGER NOT NULL DEFAULT 1 CHECK (typeof(raw_reference_price_krw) = 'integer' AND raw_reference_price_krw > 0),
     fill_price_krw INTEGER NOT NULL CHECK (typeof(fill_price_krw) = 'integer' AND fill_price_krw > 0),
     quantity INTEGER NOT NULL CHECK (typeof(quantity) = 'integer' AND quantity > 0),
     fee_krw INTEGER NOT NULL CHECK (typeof(fee_krw) = 'integer' AND fee_krw >= 0),
@@ -261,6 +262,14 @@ CREATE TABLE IF NOT EXISTS paper_fills (
     -- slippage_krw is informational only: fill_price_krw already is the executed
     -- price (slippage included), so slippage must never be charged to cash again.
     slippage_krw INTEGER NOT NULL CHECK (typeof(slippage_krw) = 'integer' AND slippage_krw >= 0),
+    fee_bps INTEGER NOT NULL DEFAULT 0 CHECK (typeof(fee_bps) = 'integer' AND fee_bps >= 0),
+    tax_bps INTEGER NOT NULL DEFAULT 0 CHECK (typeof(tax_bps) = 'integer' AND tax_bps >= 0),
+    slippage_bps INTEGER NOT NULL DEFAULT 0 CHECK (typeof(slippage_bps) = 'integer' AND slippage_bps >= 0),
+    execution_policy_sha256 TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (
+        length(execution_policy_sha256) = 64
+        AND execution_policy_sha256 = lower(execution_policy_sha256)
+        AND execution_policy_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
     observed_at TEXT NOT NULL CHECK (
         julianday(observed_at) IS NOT NULL
         AND (substr(observed_at, -1) = 'Z' OR (substr(observed_at, -6, 1) IN ('+','-') AND substr(observed_at, -3, 1) = ':'))
@@ -370,8 +379,7 @@ CREATE TABLE IF NOT EXISTS paper_nav_snapshots (
         julianday(snapshot_at) IS NOT NULL
         AND (substr(snapshot_at, -1) = 'Z' OR (substr(snapshot_at, -6, 1) IN ('+','-') AND substr(snapshot_at, -3, 1) = ':'))
     ),
-    CHECK (nav_krw = cash_krw + position_value_krw),
-    UNIQUE (account_id, session_date, snapshot_at)
+    CHECK (nav_krw = cash_krw + position_value_krw)
 );
 
 CREATE INDEX IF NOT EXISTS ix_paper_nav_snapshots_latest
@@ -764,5 +772,38 @@ DROP TRIGGER IF EXISTS trg_paper_kill_switch_events_no_delete;
 CREATE TRIGGER trg_paper_kill_switch_events_no_delete
 BEFORE DELETE ON paper_kill_switch_events FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'paper_kill_switch_events is append-only'); END;
+
+-- Task 6 cycle-level replay identity. This migration may be edited only before
+-- its first production deployment; every later schema change requires 002+.
+-- Observation/mode/source lineage cannot be
+-- soundly reconstructed from per-symbol decision rows alone.
+CREATE TABLE IF NOT EXISTS paper_cycle_commits (
+    cycle_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES paper_accounts(account_id),
+    session_id TEXT NOT NULL CHECK (typeof(session_id)='text' AND length(session_id)=10 AND date(session_id)=session_id),
+    mode TEXT NOT NULL CHECK (mode IN ('shadow', 'fills')),
+    payload_sha256 TEXT NOT NULL CHECK (typeof(payload_sha256)='text' AND length(payload_sha256)=64 AND payload_sha256=lower(payload_sha256) AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+    result_counts_json TEXT NOT NULL CHECK (
+        typeof(result_counts_json)='text' AND json_valid(result_counts_json) AND json_type(result_counts_json)='object'
+        AND json_remove(result_counts_json,'$.decisions','$.fills','$.orders','$.proposals','$.reviews')='{}'
+        AND json_type(result_counts_json,'$.decisions')='integer' AND json_extract(result_counts_json,'$.decisions')>=0
+        AND json_type(result_counts_json,'$.fills')='integer' AND json_extract(result_counts_json,'$.fills')>=0
+        AND json_type(result_counts_json,'$.orders')='integer' AND json_extract(result_counts_json,'$.orders')>=0
+        AND json_type(result_counts_json,'$.proposals')='integer' AND json_extract(result_counts_json,'$.proposals')>=0
+        AND json_type(result_counts_json,'$.reviews')='integer' AND json_extract(result_counts_json,'$.reviews')>=0
+    ),
+    committed_at TEXT NOT NULL CHECK (typeof(committed_at)='text' AND substr(committed_at,-6)='+09:00' AND julianday(committed_at) IS NOT NULL AND substr(committed_at,1,10)=session_id),
+    UNIQUE (account_id, session_id)
+);
+
+DROP TRIGGER IF EXISTS trg_paper_cycle_commits_no_update;
+CREATE TRIGGER trg_paper_cycle_commits_no_update
+BEFORE UPDATE ON paper_cycle_commits FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'paper_cycle_commits is append-only'); END;
+
+DROP TRIGGER IF EXISTS trg_paper_cycle_commits_no_delete;
+CREATE TRIGGER trg_paper_cycle_commits_no_delete
+BEFORE DELETE ON paper_cycle_commits FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'paper_cycle_commits is append-only'); END;
 
 COMMIT;
