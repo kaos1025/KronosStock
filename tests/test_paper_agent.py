@@ -45,6 +45,7 @@ from strategy.paper_agent import (
     DATA_ABSTAIN_REASONS,
     MODEL_ABSTAIN_REASONS,
     MODEL_FAILURE_ABSTAIN_REASONS,
+    OFFLINE_ABSTAIN_REASONS,
     PROPOSAL_KEYS,
     build_abstain_proposal,
     build_proposal_request,
@@ -352,6 +353,7 @@ def test_public_contract_pins_exact_keys_and_disjoint_reason_allowlists():
     assert MODEL_FAILURE_ABSTAIN_REASONS.isdisjoint(MODEL_ABSTAIN_REASONS)
     assert (
         DATA_ABSTAIN_REASONS | MODEL_FAILURE_ABSTAIN_REASONS | MODEL_ABSTAIN_REASONS
+        | OFFLINE_ABSTAIN_REASONS
         == ABSTAIN_REASONS
     )
     assert paper_agent.RESPONSE_SCHEMA_VERSION

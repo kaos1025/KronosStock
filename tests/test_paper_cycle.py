@@ -23,6 +23,9 @@ from strategy.paper_cycle import (
 from strategy.paper_risk import RiskPolicy
 
 
+PRODUCER_WRAPPER = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "produce-paper-response-bundle-once.sh"
+
+
 NOW = "2026-08-08T10:00:00+09:00"
 CUTOFF = "2026-08-08T09:59:00+09:00"
 
@@ -149,6 +152,82 @@ def _write_bundle(path, ksf):
         source_artifact_sha256=source_sha, lineage=lineage,
         responses={symbol: {} for symbol in lineage}, model_provider="offline", model_name="fixture-v1")
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _producer_env(tmp_path, ksf):
+    return {"PAPER_AGENT_BUNDLE_PRODUCER_ENABLED":"true",
+        "PAPER_AGENT_BUNDLE_DIR":str(tmp_path / "bundles"),
+        "PAPER_AGENT_KSF_DB_PATH":str(ksf), "PAPER_AGENT_HORIZON_DAYS":"5",
+        "PAPER_AGENT_SESSION_ID":"2026-08-08", "PAPER_AGENT_CYCLE_AT":NOW,
+        "PAPER_AGENT_MODEL_PROVIDER":"offline-deterministic",
+        "PAPER_AGENT_MODEL_NAME":"shadow-abstain-v1"}
+
+
+def test_offline_producer_is_byte_stable_lineage_bound_and_no_overwrite(tmp_path):
+    from ksf.offline_response_bundle_producer import produce_from_env
+    ksf = tmp_path / "ksf.sqlite3"; _ksf_db(ksf)
+    out_dir = tmp_path / "bundles"; out_dir.mkdir()
+    env = _producer_env(tmp_path, ksf)
+    first = produce_from_env(env)
+    raw = first.read_bytes()
+    value = json.loads(raw)
+    assert first == out_dir / "2026-08-08.json"
+    assert first.stat().st_mode & 0o777 == 0o600
+    assert set(value["symbols"]) == {"005930", "000660"}
+    assert value["schema_version"] == "ksf-response-bundle-v1"
+    assert value["source_artifact_sha256"] == hashlib.sha256(ksf.read_bytes()).hexdigest()
+    assert len(value["bundle_sha256"]) == 64 and value["bundle_sha256"] == value["bundle_sha256"].lower()
+    assert {tuple(item["response"].items()) for item in value["symbols"].values()} == {
+        (("offline_deterministic_abstain_reason", "OFFLINE_SHADOW_MODE"),)}
+    with pytest.raises(LedgerError, match="already exists"):
+        produce_from_env(env)
+    assert first.read_bytes() == raw
+
+
+@pytest.mark.parametrize("mutation", ["relative-source", "relative-output", "source-symlink",
+    "output-symlink", "missing-horizon", "missing-decision", "duplicate-run"])
+def test_offline_producer_rejects_unsafe_paths_and_weak_lineage(tmp_path, mutation):
+    from ksf.offline_response_bundle_producer import produce_from_env
+    ksf = tmp_path / "ksf.sqlite3"; _ksf_db(ksf)
+    out_dir = tmp_path / "bundles"; out_dir.mkdir()
+    env = _producer_env(tmp_path, ksf)
+    if mutation == "relative-source": env["PAPER_AGENT_KSF_DB_PATH"] = "ksf.sqlite3"
+    elif mutation == "relative-output": env["PAPER_AGENT_BUNDLE_DIR"] = "bundles"
+    elif mutation == "source-symlink":
+        link = tmp_path / "source-link"; link.symlink_to(ksf)
+        env["PAPER_AGENT_KSF_DB_PATH"] = str(link)
+    elif mutation == "output-symlink":
+        real = tmp_path / "real-bundles"; real.mkdir()
+        out_dir.rmdir(); out_dir.symlink_to(real, target_is_directory=True)
+    elif mutation == "missing-horizon": env["PAPER_AGENT_HORIZON_DAYS"] = "20"
+    elif mutation == "missing-decision":
+        with sqlite3.connect(ksf) as conn: conn.execute("DELETE FROM ksf_decisions WHERE symbol='005930'")
+    else:
+        with sqlite3.connect(ksf) as conn:
+            conn.execute("INSERT INTO ksf_runs VALUES(?,?,?,?,?,?,NULL)",
+                ("duplicate", "005930", "2026-08-08", "SCORING_DONE", NOW, CUTOFF))
+    with pytest.raises((LedgerError, PaperCycleDisabled)):
+        produce_from_env(env)
+    assert not (tmp_path / "paper.sqlite3").exists()
+
+
+def test_produced_bundle_commits_two_shadow_abstentions_and_no_orders(tmp_path):
+    from ksf.offline_response_bundle_producer import produce_from_env
+    paper, ksf = tmp_path / "paper.sqlite3", tmp_path / "ksf.sqlite3"
+    _seed_account(paper); _ksf_db(ksf); (tmp_path / "bundles").mkdir()
+    bundle = produce_from_env(_producer_env(tmp_path, ksf))
+    env = _runtime_env(tmp_path, paper, ksf, bundle)
+    env.update(PAPER_AGENT_MODEL_PROVIDER="offline-deterministic",
+        PAPER_AGENT_MODEL_NAME="shadow-abstain-v1")
+    result = run_cycle_from_env(env)
+    assert result.counts == {"decisions": 2, "proposals": 0, "reviews": 0, "orders": 0, "fills": 0}
+
+
+def test_producer_wrapper_disabled_and_does_not_print_payload(tmp_path):
+    disabled = subprocess.run([str(PRODUCER_WRAPPER)], env={"PATH": os.environ["PATH"]},
+        text=True, capture_output=True, check=False)
+    assert disabled.returncode == 0 and disabled.stdout == "response-bundle status=disabled\n"
+    assert "symbols" not in disabled.stdout and "offline_deterministic_abstain_reason" not in disabled.stdout
 
 
 def test_response_bundle_is_immutable_versioned_and_lineage_bound(tmp_path):

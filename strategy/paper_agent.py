@@ -141,9 +141,11 @@ MODEL_FAILURE_ABSTAIN_REASONS = frozenset(
 )
 
 #: Reasons the model itself may declare in a well-formed ABSTAIN response.
+OFFLINE_ABSTAIN_REASONS = frozenset({"OFFLINE_SHADOW_MODE"})
 MODEL_ABSTAIN_REASONS = frozenset({"NO_EDGE"})
 
-ABSTAIN_REASONS = DATA_ABSTAIN_REASONS | MODEL_FAILURE_ABSTAIN_REASONS | MODEL_ABSTAIN_REASONS
+ABSTAIN_REASONS = (DATA_ABSTAIN_REASONS | MODEL_FAILURE_ABSTAIN_REASONS
+    | MODEL_ABSTAIN_REASONS | OFFLINE_ABSTAIN_REASONS)
 
 #: Exact closed holdings schema separating the current symbol from the rest of
 #: the authoritative portfolio value.
@@ -189,6 +191,7 @@ _ABSTAIN_THESES = {
     "MODEL_PROVIDER_ERROR": "모델 제공자 오류로 단일 종목 제안을 보류합니다.",
     "MODEL_OUTPUT_INVALID": "모델 출력이 계약 검증을 통과하지 못해 단일 종목 제안을 보류합니다.",
     "NO_EDGE": "모델이 판단 우위를 확인하지 못해 단일 종목 제안을 보류합니다.",
+    "OFFLINE_SHADOW_MODE": "오프라인 결정론적 섀도 모드이므로 단일 종목 제안을 보류합니다.",
 }
 if set(_ABSTAIN_THESES) != set(ABSTAIN_REASONS):
     raise ValueError("abstain thesis copy must cover exactly the abstain reason allowlist")
@@ -1363,6 +1366,8 @@ def propose(
         # echoed, so nothing can leak into the abstention.
         return build_abstain_proposal(request, "MODEL_PROVIDER_ERROR")
     try:
+        if raw == {"offline_deterministic_abstain_reason": "OFFLINE_SHADOW_MODE"}:
+            return build_abstain_proposal(request, "OFFLINE_SHADOW_MODE")
         return validate_proposal(raw, request, mode="model")
     except (ValueError, TypeError, KeyError):
         # Expected validation failure shapes for arbitrary raw output; the
@@ -1380,6 +1385,7 @@ __all__ = [
     "MODEL_ABSTAIN_REASONS",
     "MODEL_FAILURE_ABSTAIN_REASONS",
     "MODEL_POLICY_VERSION",
+    "OFFLINE_ABSTAIN_REASONS",
     "POLICY_LIMIT_KEYS",
     "PROMPT_TEMPLATE_VERSION",
     "PROPOSAL_KEYS",
