@@ -1,7 +1,8 @@
 # Repository template only. Disabled by default; do not install or enable without approval.
 [Unit]
 Description=KronosStock isolated event-sourced paper agent cycle
-After=local-fs.target
+Requires=kronostock-ksf.service
+After=local-fs.target kronostock-ksf.service
 
 [Service]
 Type=oneshot
@@ -9,6 +10,7 @@ User=deploy
 Group=deploy
 WorkingDirectory=/srv/agent-workspaces/KronosStock
 EnvironmentFile=/etc/kronostock/paper-agent.env
+ExecStartPre=/srv/agent-workspaces/KronosStock/scripts/deploy/produce-paper-response-bundle-once.sh
 ExecStart=/srv/agent-workspaces/KronosStock/scripts/deploy/kronostock-paper-agent-once.sh
 # Wrapper final handoff (legacy contract): ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once
 TimeoutStartSec=300
@@ -23,5 +25,5 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 UMask=0077
-# External response-bundle generation remains a separate approval-gated adapter; the wrapper validates its daily immutable output.
+# The producer is an approval-gated offline adapter; a nonzero exit prevents the consumer from starting.
 # Telegram delivery is a separate approval-gated adapter; this unit has no network path.

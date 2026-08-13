@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import stat
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from ksf.feature_engine import FeatureEngine, SUPPORTED_SYMBOLS
 from paper_trading.ledger import LedgerError
 from strategy.paper_broker import MarketObservation
+
+
+_ISO_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -87,12 +91,24 @@ def load_ksf_sqlite(path: Path, *, session_id: str, horizon_days: int,
                     raise LedgerError("cross-cutoff KSF feature row")
                 try:
                     cutoff = datetime.fromisoformat(run["available_data_cutoff"])
-                    source_at = datetime.fromisoformat(row["source_as_of"])
                     ingested_at = datetime.fromisoformat(row["ingested_at_kst"])
+                    source_raw = row["source_as_of"]
+                    if not isinstance(source_raw, str):
+                        raise ValueError
+                    if _ISO_DATE_ONLY.fullmatch(source_raw):
+                        source_date = date.fromisoformat(source_raw)
+                        source_at = None
+                    else:
+                        source_at = datetime.fromisoformat(source_raw)
+                        if source_at.utcoffset() is None:
+                            raise ValueError
+                        source_date = None
                 except (TypeError, ValueError) as exc:
                     raise LedgerError("KSF feature timestamp is malformed") from exc
-                if (cutoff.utcoffset() is None or source_at.utcoffset() is None
-                        or ingested_at.utcoffset() is None or source_at > cutoff or ingested_at > cutoff):
+                if (cutoff.utcoffset() is None or ingested_at.utcoffset() is None
+                        or (source_date is not None and source_date > cutoff.date())
+                        or (source_at is not None and source_at > cutoff)
+                        or ingested_at > cutoff):
                     raise LedgerError("future KSF feature row")
                 memory.execute("INSERT INTO ksf_normalized_features VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
                     row["feature_id"], row["symbol"], row["feature_group"], row["feature_name"],

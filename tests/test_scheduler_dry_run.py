@@ -211,12 +211,22 @@ def test_paper_systemd_templates_are_disabled_by_default_and_dedicated():
     root = Path(__file__).resolve().parents[1]
     service = (root / "deploy/systemd/kronostock-paper-agent.service").read_text()
     timer = (root / "deploy/systemd/kronostock-paper-agent.timer").read_text()
+    active_service_lines = {
+        line.strip() for line in service.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
     assert "Type=oneshot" in service
     assert "python -m strategy.paper_cycle --once" in service
     assert "EnvironmentFile=/etc/kronostock/paper-agent.env" in service
     assert "User=deploy" in service and "Group=deploy" in service
     assert "WorkingDirectory=/srv/agent-workspaces/KronosStock" in service
-    assert "ExecStart=/srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once" in service
+    assert "Requires=kronostock-ksf.service" in active_service_lines
+    assert "After=local-fs.target kronostock-ksf.service" in active_service_lines
+    producer = "ExecStartPre=/srv/agent-workspaces/KronosStock/scripts/deploy/produce-paper-response-bundle-once.sh"
+    consumer = "ExecStart=/srv/agent-workspaces/KronosStock/scripts/deploy/kronostock-paper-agent-once.sh"
+    assert producer in active_service_lines
+    assert consumer in active_service_lines
+    assert service.index(producer) < service.index(consumer)
     assert "TimeoutStartSec=300" in service
     assert "ReadWritePaths=/var/lib/kronostock /run/kronostock" in service
     assert "RestrictAddressFamilies=AF_UNIX" in service
@@ -226,5 +236,9 @@ def test_paper_systemd_templates_are_disabled_by_default_and_dedicated():
     assert "RandomizedDelaySec=0" in timer and "AccuracySec=" in timer
     assert "Unit=kronostock-paper-agent.service" in timer
     assert "WantedBy=" not in timer and "WantedBy=" not in service
-    assert "external response-bundle" in service.lower()
+    active_timer_lines = {
+        line.strip() for line in timer.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert "[Install]" not in active_timer_lines and "[Install]" not in active_service_lines
     assert "telegram" in service.lower()

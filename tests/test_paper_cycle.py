@@ -30,7 +30,9 @@ NOW = "2026-08-08T10:00:00+09:00"
 CUTOFF = "2026-08-08T09:59:00+09:00"
 
 
-def _snapshot(symbol="005930", *, omit=(), cutoff=CUTOFF):
+def _snapshot(symbol="005930", *, omit=(), cutoff=CUTOFF, as_of=NOW,
+              source_as_of="2026-08-08T09:58:30+09:00",
+              ingested_at="2026-08-08T09:58:31+09:00"):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("""CREATE TABLE ksf_normalized_features (
@@ -47,9 +49,9 @@ def _snapshot(symbol="005930", *, omit=(), cutoff=CUTOFF):
         if name not in omit:
             conn.execute("INSERT INTO ksf_normalized_features VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
                 "f-" + name, symbol, group, name, value, unit,
-                "2026-08-08T09:58:30+09:00", "READY", None,
-                "2026-08-08T09:58:31+09:00", "2026-08-08T09:58:31+09:00"))
-    result = FeatureEngine(conn).build_symbol(symbol, available_data_cutoff=cutoff, as_of_kst=NOW)
+                source_as_of, "READY", None,
+                ingested_at, ingested_at))
+    result = FeatureEngine(conn).build_symbol(symbol, available_data_cutoff=cutoff, as_of_kst=as_of)
     conn.close()
     return result
 
@@ -99,7 +101,9 @@ def _seed_account(path):
     ledger.close()
 
 
-def _ksf_db(path, *, status="SCORING_DONE"):
+def _ksf_db(path, *, status="SCORING_DONE", cutoff=CUTOFF, as_of=NOW,
+            source_as_of="2026-08-08T09:58:30+09:00",
+            ingested_at="2026-08-08T09:58:31+09:00"):
     conn = sqlite3.connect(path)
     conn.executescript("""
     CREATE TABLE ksf_runs(run_id TEXT, symbol TEXT, trading_date TEXT, run_status TEXT,
@@ -114,7 +118,7 @@ def _ksf_db(path, *, status="SCORING_DONE"):
     for symbol in sorted(("005930", "000660")):
         run = "run-" + symbol
         conn.execute("INSERT INTO ksf_runs VALUES(?,?,?,?,?,?,NULL)",
-            (run, symbol, "2026-08-08", status, NOW, CUTOFF))
+            (run, symbol, "2026-08-08", status, as_of, cutoff))
         rows = {
             "close": (70_000.0, "KRW", "domestic_price"), "volume": (1000.0, "shares", "domestic_price"),
             "foreigner_net_buy_quantity": (100.0, "shares", "domestic_investor_flow"),
@@ -122,10 +126,13 @@ def _ksf_db(path, *, status="SCORING_DONE"):
         for name, (value, unit, group) in rows.items():
             conn.execute("INSERT INTO ksf_normalized_features VALUES(?,?,?,?,?,'v1','READY',?,NULL,NULL,?,?,?,?,NULL)",
                 (symbol+name, run, symbol, group, name, value, unit,
-                 "2026-08-08T09:58:30+09:00", "2026-08-08T09:58:31+09:00", CUTOFF))
-        digest = hashlib.sha256(_snapshot(symbol).stable_json().encode()).hexdigest()
+                 source_as_of, ingested_at, cutoff))
+        digest = hashlib.sha256(_snapshot(
+            symbol, cutoff=cutoff, as_of=as_of, source_as_of=source_as_of,
+            ingested_at=ingested_at,
+        ).stable_json().encode()).hexdigest()
         conn.execute("INSERT INTO ksf_decisions VALUES(?,?,?,?,?,?,?)",
-            ("ksf-"+symbol, run, symbol, 5, NOW, CUTOFF, digest))
+            ("ksf-"+symbol, run, symbol, 5, as_of, cutoff, digest))
     conn.commit(); conn.close()
 
 
@@ -279,6 +286,64 @@ def test_env_runtime_loads_read_only_source_and_persists_real_shadow_cycle(tmp_p
     assert result.committed and result.counts["decisions"] == 2
     with PaperLedger(paper) as ledger:
         assert ledger.conn.execute("SELECT count(*) FROM paper_cycle_commits").fetchone()[0] == 1
+
+
+def test_source_accepts_exact_date_only_and_preserves_stored_value(tmp_path):
+    from strategy.paper_source import load_ksf_sqlite
+
+    ksf = tmp_path / "ksf.sqlite3"
+    _ksf_db(ksf, source_as_of="2026-08-08")
+
+    lineages, _ = load_ksf_sqlite(
+        ksf.resolve(), session_id="2026-08-08", horizon_days=5,
+        cycle_at=NOW, source_sha256=hashlib.sha256(ksf.read_bytes()).hexdigest(),
+    )
+
+    assert {
+        feature.source_as_of
+        for lineage in lineages
+        for group in lineage.feature_snapshot.groups.values()
+        for feature in group.features
+    } == {"2026-08-08"}
+
+
+def test_source_date_only_uses_cutoff_encoded_local_date_not_utc_date(tmp_path):
+    from strategy.paper_source import load_ksf_sqlite
+
+    ksf = tmp_path / "ksf.sqlite3"
+    cutoff = "2026-08-08T23:30:00-10:00"  # 2026-08-09 in UTC, but local date is the 8th.
+    cycle_at = "2026-08-08T23:31:00-10:00"
+    _ksf_db(ksf, cutoff=cutoff, as_of=cycle_at, source_as_of="2026-08-09")
+
+    with pytest.raises(LedgerError, match="future KSF feature row"):
+        load_ksf_sqlite(
+            ksf.resolve(), session_id="2026-08-08", horizon_days=5,
+            cycle_at=cycle_at, source_sha256=hashlib.sha256(ksf.read_bytes()).hexdigest(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_as_of", "message"),
+    [
+        ("2026-08-09", "future KSF feature row"),
+        ("2026-08-08T09:58:30", "KSF feature timestamp is malformed"),
+        ("2026-02-30", "KSF feature timestamp is malformed"),
+        ("not-a-date", "KSF feature timestamp is malformed"),
+    ],
+)
+def test_source_rejects_future_date_only_naive_datetime_and_malformed_values(
+    tmp_path, source_as_of, message
+):
+    from strategy.paper_source import load_ksf_sqlite
+
+    ksf = tmp_path / "ksf.sqlite3"
+    _ksf_db(ksf, source_as_of=source_as_of)
+
+    with pytest.raises(LedgerError, match=message):
+        load_ksf_sqlite(
+            ksf.resolve(), session_id="2026-08-08", horizon_days=5,
+            cycle_at=NOW, source_sha256=hashlib.sha256(ksf.read_bytes()).hexdigest(),
+        )
 
 
 def test_invalid_source_status_precedes_lock_and_paper_ledger_mutation(tmp_path):
