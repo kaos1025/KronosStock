@@ -24,6 +24,7 @@ from strategy.paper_risk import RiskPolicy
 
 
 PRODUCER_WRAPPER = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "produce-paper-response-bundle-once.sh"
+CONSUMER_WRAPPER = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "kronostock-paper-agent-once.sh"
 
 
 NOW = "2026-08-08T10:00:00+09:00"
@@ -170,6 +171,52 @@ def _producer_env(tmp_path, ksf):
         "PAPER_AGENT_MODEL_NAME":"shadow-abstain-v1"}
 
 
+def _wrapper_fixture(tmp_path, *, producer_exit=0):
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    date_calls = tmp_path / "date-calls"
+    (fake_bin / "date").write_text("""#!/usr/bin/env bash
+count=0
+[[ ! -f "$DATE_CALLS" ]] || count="$(cat "$DATE_CALLS")"
+count=$((count + 1)); printf '%s' "$count" > "$DATE_CALLS"
+if [[ "$count" == 1 ]]; then printf '%s\\n' '2026-08-13T20:16:08+09:00';
+else printf '%s\\n' '2026-08-13T20:19:49+09:00'; fi
+""")
+    (fake_bin / "date").chmod(0o755)
+    for package in ("ksf", "strategy"):
+        directory = tmp_path / package; directory.mkdir()
+        (directory / "__init__.py").write_text("")
+    (tmp_path / "ksf" / "offline_response_bundle_producer.py").write_text("""import json, os, pathlib, sys
+record = pathlib.Path(os.environ['PRODUCER_RECORD'])
+record.write_text(json.dumps({'session': os.environ['PAPER_AGENT_SESSION_ID'], 'cycle': os.environ['PAPER_AGENT_CYCLE_AT']}))
+if int(os.environ.get('FAKE_PRODUCER_EXIT', '0')): sys.exit(int(os.environ['FAKE_PRODUCER_EXIT']))
+bundle = pathlib.Path(os.environ['PAPER_AGENT_BUNDLE_DIR']) / (os.environ['PAPER_AGENT_SESSION_ID'] + '.json')
+bundle.parent.mkdir(exist_ok=True); bundle.write_text('{}')
+""")
+    (tmp_path / "strategy" / "paper_cycle.py").write_text("""import json, os, pathlib
+pathlib.Path(os.environ['CONSUMER_RECORD']).write_text(json.dumps({
+    'session': os.environ['PAPER_AGENT_SESSION_ID'], 'cycle': os.environ['PAPER_AGENT_CYCLE_AT'],
+    'bundle': os.environ['PAPER_AGENT_RESPONSE_BUNDLE_PATH']}))
+""")
+    ksf = tmp_path / "ksf.sqlite3"; ksf.write_bytes(b"ksf")
+    bundles = tmp_path / "bundles"; bundles.mkdir()
+    handoff = tmp_path / "paper-agent-cycle.env"
+    common = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(tmp_path),
+        "DATE_CALLS": str(date_calls), "PAPER_AGENT_BUNDLE_DIR": str(bundles),
+        "PAPER_AGENT_KSF_DB_PATH": str(ksf), "PAPER_AGENT_CYCLE_HANDOFF_PATH": str(handoff)}
+    producer = {**common, "PAPER_AGENT_BUNDLE_PRODUCER_ENABLED": "true",
+        "PAPER_AGENT_HORIZON_DAYS": "5", "PAPER_AGENT_MODEL_PROVIDER": "offline",
+        "PAPER_AGENT_MODEL_NAME": "fixture", "PRODUCER_RECORD": str(tmp_path / "producer.json"),
+        "FAKE_PRODUCER_EXIT": str(producer_exit)}
+    consumer = {**common, "PAPER_AGENT_ENABLED": "true", "PAPER_AGENT_MODE": "shadow",
+        "CONSUMER_RECORD": str(tmp_path / "consumer.json")}
+    return producer, consumer, handoff, date_calls
+
+
+def _run_wrapper(wrapper, env, tmp_path):
+    return subprocess.run([str(wrapper)], cwd=tmp_path, env=env, text=True,
+        capture_output=True, check=False)
+
+
 def test_offline_producer_is_byte_stable_lineage_bound_and_no_overwrite(tmp_path):
     from ksf.offline_response_bundle_producer import produce_from_env
     ksf = tmp_path / "ksf.sqlite3"; _ksf_db(ksf)
@@ -235,6 +282,72 @@ def test_producer_wrapper_disabled_and_does_not_print_payload(tmp_path):
         text=True, capture_output=True, check=False)
     assert disabled.returncode == 0 and disabled.stdout == "response-bundle status=disabled\n"
     assert "symbols" not in disabled.stdout and "offline_deterministic_abstain_reason" not in disabled.stdout
+
+
+def test_wrappers_share_producer_identity_and_consumer_never_calls_date(tmp_path):
+    producer_env, consumer_env, _, date_calls = _wrapper_fixture(tmp_path)
+    produced = _run_wrapper(PRODUCER_WRAPPER, producer_env, tmp_path)
+    consumed = _run_wrapper(CONSUMER_WRAPPER, consumer_env, tmp_path)
+    assert produced.returncode == consumed.returncode == 0
+    producer = json.loads((tmp_path / "producer.json").read_text())
+    consumer = json.loads((tmp_path / "consumer.json").read_text())
+    assert producer == {"session": "2026-08-13", "cycle": "2026-08-13T20:16:08+09:00"}
+    assert consumer["session"] == producer["session"]
+    assert consumer["cycle"] == producer["cycle"]
+    assert consumer["bundle"] == str(tmp_path / "bundles" / "2026-08-13.json")
+    assert date_calls.read_text() == "1"
+
+
+def test_producer_handoff_is_atomic_private_and_closed(tmp_path):
+    producer_env, _, handoff, _ = _wrapper_fixture(tmp_path)
+    observed = []
+    stop = threading.Event()
+    def inspect():
+        while not stop.is_set():
+            if handoff.exists(): observed.append(handoff.read_bytes())
+    watcher = threading.Thread(target=inspect); watcher.start()
+    result = _run_wrapper(PRODUCER_WRAPPER, producer_env, tmp_path)
+    stop.set(); watcher.join()
+    expected = (b"PAPER_AGENT_SESSION_ID=2026-08-13\n"
+        b"PAPER_AGENT_CYCLE_AT=2026-08-13T20:16:08+09:00\n")
+    assert result.returncode == 0 and handoff.read_bytes() == expected
+    assert handoff.stat().st_mode & 0o777 == 0o600
+    assert all(value == expected for value in observed)
+    assert not list(tmp_path.glob(".paper-agent-cycle.env.*"))
+
+
+def test_producer_failure_invalidates_stale_handoff_and_consumer_fails_closed(tmp_path):
+    producer_env, consumer_env, handoff, _ = _wrapper_fixture(tmp_path, producer_exit=9)
+    handoff.write_text("PAPER_AGENT_SESSION_ID=2026-08-12\nPAPER_AGENT_CYCLE_AT=2026-08-12T20:00:00+09:00\n")
+    handoff.chmod(0o600)
+    produced = _run_wrapper(PRODUCER_WRAPPER, producer_env, tmp_path)
+    consumed = _run_wrapper(CONSUMER_WRAPPER, consumer_env, tmp_path)
+    assert produced.returncode == 9
+    assert not handoff.exists()
+    assert consumed.returncode != 0 and not (tmp_path / "consumer.json").exists()
+
+
+@pytest.mark.parametrize("case", ["missing", "relative", "symlink", "bad-mode",
+    "bad-session", "bad-cycle", "date-mismatch", "duplicate", "extra", "injection"])
+def test_consumer_rejects_unsafe_handoff_before_python(tmp_path, case):
+    _, env, handoff, _ = _wrapper_fixture(tmp_path)
+    content = "PAPER_AGENT_SESSION_ID=2026-08-13\nPAPER_AGENT_CYCLE_AT=2026-08-13T20:16:08+09:00\n"
+    if case == "relative": env["PAPER_AGENT_CYCLE_HANDOFF_PATH"] = "paper-agent-cycle.env"
+    elif case == "symlink":
+        target = tmp_path / "target"; target.write_text(content); target.chmod(0o600)
+        handoff.symlink_to(target)
+    elif case != "missing":
+        if case == "bad-session": content = content.replace("2026-08-13", "2026-8-13", 1)
+        elif case == "bad-cycle": content = content.replace("+09:00", "Z")
+        elif case == "date-mismatch": content = content.replace("2026-08-13T", "2026-08-12T")
+        elif case == "duplicate": content += "PAPER_AGENT_SESSION_ID=2026-08-13\n"
+        elif case == "extra": content += "OTHER=value\n"
+        elif case == "injection": content = content.replace("2026-08-13\n", "$(touch PWNED)\n", 1)
+        handoff.write_text(content); handoff.chmod(0o644 if case == "bad-mode" else 0o600)
+    result = _run_wrapper(CONSUMER_WRAPPER, env, tmp_path)
+    assert result.returncode != 0
+    assert not (tmp_path / "consumer.json").exists()
+    assert not (tmp_path / "PWNED").exists()
 
 
 def test_response_bundle_is_immutable_versioned_and_lineage_bound(tmp_path):
@@ -393,20 +506,13 @@ def test_fills_env_requires_explicit_fills_gate_before_any_runtime_access(tmp_pa
 
 
 def test_one_shot_wrapper_is_disabled_by_default_and_keeps_fill_gate_separate(tmp_path):
-    wrapper = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "kronostock-paper-agent-once.sh"
-    disabled = subprocess.run([str(wrapper)], env={"PATH": os.environ["PATH"]},
+    disabled = subprocess.run([str(CONSUMER_WRAPPER)], env={"PATH": os.environ["PATH"]},
         text=True, capture_output=True, check=False)
     assert disabled.returncode == 0 and disabled.stdout == "paper-cycle status=disabled\n"
-    fills = subprocess.run([str(wrapper)], env={"PATH": os.environ["PATH"],
+    fills = subprocess.run([str(CONSUMER_WRAPPER)], env={"PATH": os.environ["PATH"],
         "PAPER_AGENT_ENABLED": "true", "PAPER_AGENT_MODE": "fills"},
         text=True, capture_output=True, check=False)
     assert fills.returncode != 0 and fills.stderr == "paper-cycle status=failed\n"
-    source = wrapper.read_text()
-    assert 'bundle_path="${PAPER_AGENT_BUNDLE_DIR%/}/${session_id}.json"' in source
-    assert 'export PAPER_AGENT_SESSION_ID="${session_id}"' in source
-    assert 'export PAPER_AGENT_CYCLE_AT="${cycle_at}"' in source
-    assert '[[ -f "${bundle_path}" && ! -L "${bundle_path}" ]]' in source
-    assert source.index('[[ -f "${bundle_path}"') < source.index("exec /srv/agent-workspaces")
 
 
 @pytest.mark.parametrize("missing", ["bundle", "source"])
