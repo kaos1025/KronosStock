@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import sqlite3
 import stat
 import threading
@@ -300,6 +301,38 @@ def test_migration_is_rerunnable(db_path: Path) -> None:
         assert versions == 1
     finally:
         second.close()
+
+
+def test_reopening_canonical_database_is_byte_and_mtime_stable(db_path: Path) -> None:
+    with PaperLedger(db_path):
+        pass
+    before = (hashlib.sha256(db_path.read_bytes()).digest(), db_path.stat().st_mtime_ns)
+
+    with PaperLedger(db_path):
+        pass
+
+    after = (hashlib.sha256(db_path.read_bytes()).digest(), db_path.stat().st_mtime_ns)
+    assert after == before
+
+
+def test_versioned_database_with_missing_trigger_is_repaired(db_path: Path) -> None:
+    with PaperLedger(db_path) as first:
+        first.conn.execute("DROP TRIGGER trg_paper_accounts_no_update")
+
+    with PaperLedger(db_path) as repaired:
+        seed_account(repaired)
+        with pytest.raises(sqlite3.IntegrityError):
+            repaired.conn.execute(
+                "UPDATE paper_accounts SET policy_version = 'changed' WHERE account_id = 'acct-1'"
+            )
+
+
+def test_incompatible_versioned_schema_fails_closed(db_path: Path) -> None:
+    with PaperLedger(db_path) as first:
+        first.conn.execute("ALTER TABLE paper_schema_versions ADD COLUMN unexpected TEXT")
+
+    with pytest.raises(LedgerError, match="incompatible with canonical migration 001"):
+        PaperLedger(db_path)
 
 
 def test_migration_script_rerun_raw(ledger: PaperLedger) -> None:

@@ -24,6 +24,16 @@ from typing import Any, Iterator, Mapping
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 MIGRATION_001 = MIGRATIONS_DIR / "001_autonomous_paper_trading_ledgers.sql"
 _MIGRATION_LOCK = threading.Lock()
+_CANONICAL_SCHEMA: tuple[tuple[str, str, str, str], ...] | None = None
+
+_APPLICATION_SCHEMA_SQL = """
+SELECT type, name, tbl_name, sql
+FROM sqlite_schema
+WHERE sql IS NOT NULL
+  AND (name GLOB 'paper_*' OR name GLOB 'trg_paper_*'
+       OR name GLOB 'ix_paper_*' OR name GLOB 'ux_paper_*')
+ORDER BY type, name
+"""
 
 SUPPORTED_SYMBOLS = frozenset({"005930", "000660"})
 AGENT_ACTIONS = frozenset({"ENTER", "HOLD", "REDUCE", "EXIT", "ABSTAIN"})
@@ -56,6 +66,32 @@ class LedgerError(ValueError):
 
 class LedgerConflictError(LedgerError):
     """동일 식별자/멱등 키 재생 시 payload 가 기존 기록과 다른 경우."""
+
+
+def _application_schema(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(tuple(row) for row in conn.execute(_APPLICATION_SCHEMA_SQL))
+
+
+def _canonical_schema(migration_sql: str) -> tuple[tuple[str, str, str, str], ...]:
+    global _CANONICAL_SCHEMA
+    if _CANONICAL_SCHEMA is None:
+        reference = sqlite3.connect(":memory:")
+        try:
+            reference.executescript(migration_sql)
+            _CANONICAL_SCHEMA = _application_schema(reference)
+        finally:
+            reference.close()
+    return _CANONICAL_SCHEMA
+
+
+def _schema_is_canonical(conn: sqlite3.Connection,
+                         expected: tuple[tuple[str, str, str, str], ...]) -> bool:
+    if _application_schema(conn) != expected:
+        return False
+    version = conn.execute(
+        "SELECT name FROM paper_schema_versions WHERE version = 1"
+    ).fetchone()
+    return version is not None and version[0] == "001_autonomous_paper_trading_ledgers"
 
 
 def _write_transaction(method):
@@ -125,10 +161,18 @@ class PaperLedger:
         self.conn.isolation_level = None  # 명시적 BEGIN IMMEDIATE 로만 트랜잭션 제어
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA busy_timeout = 5000")
-        # The canonical migration recreates triggers. Serialize that DDL among
-        # same-process workers before execution transactions contend normally.
+        # Serialize schema inspection/repair among same-process workers. Healthy
+        # ledgers take the read-only path, avoiding trigger recreation entirely.
         with _MIGRATION_LOCK:
-            self.conn.executescript(MIGRATION_001.read_text(encoding="utf-8"))
+            migration_sql = MIGRATION_001.read_text(encoding="utf-8")
+            expected_schema = _canonical_schema(migration_sql)
+            if not _schema_is_canonical(self.conn, expected_schema):
+                self.conn.executescript(migration_sql)
+                if not _schema_is_canonical(self.conn, expected_schema):
+                    self.conn.close()
+                    raise LedgerError(
+                        "paper ledger schema is incompatible with canonical migration 001"
+                    )
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._savepoint_seq = 0
 
