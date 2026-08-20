@@ -55,6 +55,9 @@ LIFECYCLE_LABEL = {"ai_proposed": "AI 제안", "risk_rejected": "위험 검토 �
                    "abstained": "판단 보류", "no_action": "조치 없음",
                    "unavailable": "확인 불가"}
 
+_RUNTIME_COUNT_KEYS = ("nav_snapshots", "decisions", "cycle_commits", "proposals",
+                       "reviews", "orders", "fills")
+
 
 def _enum(mapping: dict[str, tuple[str, str]], value: object) -> tuple[str, str]:
     return mapping.get(value, ("unavailable", "확인 불가"))
@@ -203,6 +206,74 @@ def get_decisions(symbol: str) -> dict[str, object]:
             return {"status": "ok", "symbol": symbol, "decisions": [_public_row(row) for row in rows]}
         except (sqlite3.Error, TypeError, ValueError, KeyError, json.JSONDecodeError):
             return {"status": "unavailable", "symbol": symbol, "decisions": []}
+
+
+def _empty_runtime_status(status: str) -> dict[str, object]:
+    counts = {key: 0 for key in _RUNTIME_COUNT_KEYS}
+    return {"status": status, "latest_mode": None, "latest_session_id": None,
+            "latest_committed_at": None, "latest_cycle_id": None,
+            "latest_snapshot_at": None, "counts": counts,
+            "safety": {"orders_zero": False, "fills_zero": False,
+                       "proposals_zero": False, "reviews_zero": False,
+                       "shadow_mode": None}, "recent_decisions": []}
+
+
+def get_runtime_status() -> dict[str, object]:
+    """Return a fixed, sanitized operational summary of the selected paper account."""
+    account = os.environ.get("PAPER_ACCOUNT_ID", "")
+    with _connection() as conn:
+        if conn is None:
+            return _empty_runtime_status("no_data")
+        try:
+            count_sql = {
+                "nav_snapshots": "SELECT count(*) FROM paper_nav_snapshots WHERE account_id=?",
+                "decisions": "SELECT count(*) FROM paper_agent_decisions WHERE account_id=?",
+                "cycle_commits": "SELECT count(*) FROM paper_cycle_commits WHERE account_id=?",
+                "proposals": "SELECT count(*) FROM paper_order_proposals WHERE account_id=?",
+                "reviews": """SELECT count(*) FROM paper_risk_reviews r
+                    JOIN paper_order_proposals p ON p.proposal_id=r.proposal_id WHERE p.account_id=?""",
+                "orders": "SELECT count(*) FROM paper_orders WHERE account_id=?",
+                "fills": """SELECT count(*) FROM paper_fills f
+                    JOIN paper_orders o ON o.order_id=f.order_id WHERE o.account_id=?""",
+            }
+            counts = {key: conn.execute(sql, (account,)).fetchone()[0]
+                      for key, sql in count_sql.items()}
+            if any(type(value) is not int or value < 0 for value in counts.values()):
+                raise ValueError("invalid count")
+            cycle = conn.execute("""SELECT cycle_id,session_id,mode,committed_at
+                FROM paper_cycle_commits WHERE account_id=?
+                ORDER BY julianday(committed_at) DESC,committed_at DESC,cycle_id DESC LIMIT 1""",
+                (account,)).fetchone()
+            snapshot = conn.execute("""SELECT snapshot_at FROM paper_nav_snapshots WHERE account_id=?
+                ORDER BY julianday(snapshot_at) DESC,snapshot_at DESC,nav_snapshot_id DESC LIMIT 1""",
+                (account,)).fetchone()
+            decision_rows = conn.execute("""SELECT decision_id,symbol,created_at,action,reason_code
+                FROM paper_agent_decisions WHERE account_id=?
+                ORDER BY julianday(created_at) DESC,created_at DESC,decision_id DESC LIMIT 10""",
+                (account,)).fetchall()
+            recent = []
+            for row in decision_rows:
+                action, action_label = _enum(ACTION, row["action"])
+                reason, reason_label = _enum(DECISION_REASON, row["reason_code"])
+                recent.append({"decision_id": _scalar(row["decision_id"]),
+                    "symbol": row["symbol"] if row["symbol"] in SUPPORTED_SYMBOLS else "unavailable",
+                    "decided_at": _timestamp(row["created_at"]), "action": action,
+                    "action_label": action_label, "reason": reason, "reason_label": reason_label})
+            mode = cycle["mode"] if cycle is not None and cycle["mode"] in ("shadow", "fills") else None
+            result = _empty_runtime_status("ok" if any(counts.values()) else "no_data")
+            result.update({"latest_mode": mode,
+                "latest_session_id": _scalar(cycle["session_id"]) if cycle is not None else None,
+                "latest_committed_at": _timestamp(cycle["committed_at"]) if cycle is not None else None,
+                "latest_cycle_id": _scalar(cycle["cycle_id"]) if cycle is not None else None,
+                "latest_snapshot_at": _timestamp(snapshot["snapshot_at"]) if snapshot is not None else None,
+                "counts": counts, "safety": {"orders_zero": counts["orders"] == 0,
+                    "fills_zero": counts["fills"] == 0, "proposals_zero": counts["proposals"] == 0,
+                    "reviews_zero": counts["reviews"] == 0,
+                    "shadow_mode": mode == "shadow" if mode is not None else None},
+                "recent_decisions": recent})
+            return result
+        except (sqlite3.Error, TypeError, ValueError, KeyError):
+            return _empty_runtime_status("unavailable")
 
 
 def get_account() -> dict[str, object]:

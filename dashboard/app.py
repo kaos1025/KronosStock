@@ -27,6 +27,7 @@ from strategy.paper_web_api import (
     get_account as get_paper_account,
     get_decisions as get_paper_decisions,
     get_orders as get_paper_orders,
+    get_runtime_status as get_paper_runtime_status,
 )
 from ksf.web_api import get_cards, get_detail
 
@@ -171,7 +172,7 @@ def _paper_time(value: object) -> str:
         return "—"
 
 
-def _paper_document(account: dict, rows: list[dict]) -> HTMLResponse:
+def _paper_document(account: dict, rows: list[dict], runtime: dict) -> HTMLResponse:
     if account.get("status") == "ok":
         kill = "해제" if account.get("kill_switch") == "released" else "작동 또는 확인 불가"
         cards = (("계좌 NAV", account.get("nav_krw")), ("현금", account.get("cash_krw")),
@@ -188,9 +189,20 @@ def _paper_document(account: dict, rows: list[dict]) -> HTMLResponse:
     recent = "".join(f'<tr><td data-label="종목">{html.escape(str(r.get("symbol", "—")))}</td><td data-label="판단">{html.escape(str(r.get("action_label", "확인 불가")))}</td><td data-label="상태">{html.escape(str(r.get("lifecycle_label", "확인 불가")))}</td><td data-label="시각">{html.escape(_paper_time(r.get("decided_at")))}</td></tr>' for r in rows[:10])
     recent = recent or '<tr><td data-label="안내" colspan="4">최근 기록 없음</td></tr>'
     legend = " · ".join(("AI 제안", "위험 검토 거절", "체결 대기", "미체결 종료", "체결 완료", "판단 보류", "조치 없음"))
+    counts = runtime.get("counts", {}) if isinstance(runtime.get("counts"), dict) else {}
+    safety = runtime.get("safety", {}) if isinstance(runtime.get("safety"), dict) else {}
+    mode_label = {"shadow": "섀도우 (실주문 비활성)", "fills": "체결 기록 감지"}.get(runtime.get("latest_mode"), "확인 불가")
+    posture = "안전" if safety.get("orders_zero") is True and safety.get("fills_zero") is True else "주의: 주문 또는 체결 기록 있음"
+    runtime_cards = (("운용 모드", mode_label), ("안전 상태", posture),
+        ("최근 세션", runtime.get("latest_session_id") or "—"),
+        ("최근 스냅샷", _paper_time(runtime.get("latest_snapshot_at"))),
+        ("판단 / 사이클", f'{counts.get("decisions", 0)} / {counts.get("cycle_commits", 0)}'),
+        ("제안 / 검토 / 주문 / 체결", f'{counts.get("proposals", 0)} / {counts.get("reviews", 0)} / {counts.get("orders", 0)} / {counts.get("fills", 0)}'))
+    runtime_html = "".join(f'<article class="paper-card"><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></article>' for label, value in runtime_cards)
     document = f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>모의 운용 현황</title><style>{_PAPER_CSS}</style></head><body>
-<header class="paper-top"><nav class="paper-nav" aria-label="모의 운용 탐색"><a href="/paper">현황</a><a href="/paper/orders">주문 기록 JSON</a><a href="/paper/decisions/005930">005930 판단</a><a href="/paper/decisions/000660">000660 판단</a></nav><h1>모의 운용 현황</h1><p>인증된 읽기 전용 화면</p>{state}</header>
+<header class="paper-top"><nav class="paper-nav" aria-label="모의 운용 탐색"><a href="/paper">현황</a><a href="/paper/status">섀도우 상태 JSON</a><a href="/paper/orders">주문 기록 JSON</a><a href="/paper/decisions/005930">005930 판단</a><a href="/paper/decisions/000660">000660 판단</a></nav><h1>모의 운용 현황</h1><p>인증된 읽기 전용 화면</p>{state}</header>
 <main class="paper-main"><section aria-labelledby="account-title"><h2 id="account-title">계좌 요약</h2><div class="paper-grid">{cards_html}</div></section>
+<section class="paper-section" aria-labelledby="runtime-title"><h2 id="runtime-title">섀도우 런타임 상태</h2><p>관측 전용이며 거래 기능을 제공하지 않습니다.</p><div class="paper-grid">{runtime_html}</div></section>
 <section class="paper-section" aria-labelledby="positions-title"><h2 id="positions-title">보유 포지션</h2><table class="paper-table"><thead><tr><th>종목</th><th>수량</th><th>기준가</th><th>평가액</th></tr></thead><tbody>{positions}</tbody></table></section>
 <section class="paper-section" aria-labelledby="life-title"><h2 id="life-title">최근 처리 기록</h2><p>{html.escape(legend)}</p><table class="paper-table"><thead><tr><th>종목</th><th>판단</th><th>상태</th><th>시각</th></tr></thead><tbody>{recent}</tbody></table></section></main></body></html>'''
     return HTMLResponse(document)
@@ -199,6 +211,7 @@ def _paper_document(account: dict, rows: list[dict]) -> HTMLResponse:
 @app.get("/paper", response_class=HTMLResponse)
 def paper_dashboard(_: None = Depends(_require_ksf_auth)) -> HTMLResponse:
     account = get_paper_account()
+    runtime = get_paper_runtime_status()
     orders = get_paper_orders()
     decisions = []
     for symbol in sorted(PAPER_SUPPORTED_SYMBOLS):
@@ -213,7 +226,12 @@ def paper_dashboard(_: None = Depends(_require_ksf_auth)) -> HTMLResponse:
             return (0, datetime.min.replace(tzinfo=timezone.utc))
 
     decisions.sort(key=decision_sort_key, reverse=True)
-    return _paper_document(account, decisions if decisions else orders.get("orders", []))
+    return _paper_document(account, decisions if decisions else orders.get("orders", []), runtime)
+
+
+@app.get("/paper/status")
+def paper_status(_: None = Depends(_require_ksf_auth)) -> dict:
+    return get_paper_runtime_status()
 
 
 @app.get("/paper/orders")
