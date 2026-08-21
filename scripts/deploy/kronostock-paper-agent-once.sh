@@ -17,6 +17,15 @@ fi
 : "${PAPER_AGENT_BUNDLE_DIR:?required}"
 : "${PAPER_AGENT_KSF_DB_PATH:?required}"
 : "${PAPER_AGENT_CYCLE_HANDOFF_PATH:?required}"
+: "${PAPER_AGENT_PYTHON:=/usr/bin/python3}"
+
+[[ "${PAPER_AGENT_PYTHON}" = /* ]]
+python_real="$(readlink -f -- "${PAPER_AGENT_PYTHON}")"
+if [[ "${python_real}" == /home || "${python_real}" == /home/* ]]; then
+  printf '%s\n' 'paper-agent Python must not resolve through /home' >&2
+  exit 1
+fi
+[[ -x "${PAPER_AGENT_PYTHON}" ]]
 
 [[ "${PAPER_AGENT_CYCLE_HANDOFF_PATH}" = /* ]]
 [[ -f "${PAPER_AGENT_CYCLE_HANDOFF_PATH}" && ! -L "${PAPER_AGENT_CYCLE_HANDOFF_PATH}" ]]
@@ -50,4 +59,4 @@ bundle_path="${PAPER_AGENT_BUNDLE_DIR%/}/${session_id}.json"
 export PAPER_AGENT_SESSION_ID="${session_id}"
 export PAPER_AGENT_CYCLE_AT="${cycle_at}"
 export PAPER_AGENT_RESPONSE_BUNDLE_PATH="${bundle_path}"
-exec /srv/agent-workspaces/KronosStock/.venv/bin/python -m strategy.paper_cycle --once
+exec "${PAPER_AGENT_PYTHON}" -m strategy.paper_cycle --once

@@ -216,7 +216,7 @@ def test_paper_systemd_templates_are_disabled_by_default_and_dedicated():
         if line.strip() and not line.lstrip().startswith("#")
     }
     assert "Type=oneshot" in service
-    assert "python -m strategy.paper_cycle --once" in service
+    assert "${PAPER_AGENT_PYTHON} -m strategy.paper_cycle --once" in service
     assert "EnvironmentFile=/etc/kronostock/paper-agent.env" in service
     assert "User=deploy" in service and "Group=deploy" in service
     assert "WorkingDirectory=/srv/agent-workspaces/KronosStock" in service
@@ -231,6 +231,8 @@ def test_paper_systemd_templates_are_disabled_by_default_and_dedicated():
     assert "ReadWritePaths=/var/lib/kronostock /run/kronostock" in service
     assert "RestrictAddressFamilies=AF_UNIX" in service
     assert "NoNewPrivileges=true" in service and "PrivateTmp=true" in service
+    assert "ProtectHome=true" in active_service_lines
+    assert "Environment=PAPER_AGENT_PYTHON=/usr/bin/python3" in active_service_lines
     assert "kis" not in service.lower() and "broker" not in service.lower()
     assert "Persistent=false" in timer
     assert "RandomizedDelaySec=0" in timer and "AccuracySec=" in timer

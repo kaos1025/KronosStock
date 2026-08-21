@@ -12,6 +12,15 @@ fi
 : "${PAPER_AGENT_MODEL_PROVIDER:?required}"
 : "${PAPER_AGENT_MODEL_NAME:?required}"
 : "${PAPER_AGENT_CYCLE_HANDOFF_PATH:?required}"
+: "${PAPER_AGENT_PYTHON:=/usr/bin/python3}"
+
+[[ "${PAPER_AGENT_PYTHON}" = /* ]]
+python_real="$(readlink -f -- "${PAPER_AGENT_PYTHON}")"
+if [[ "${python_real}" == /home || "${python_real}" == /home/* ]]; then
+  printf '%s\n' 'paper-agent Python must not resolve through /home' >&2
+  exit 1
+fi
+[[ -x "${PAPER_AGENT_PYTHON}" ]]
 
 [[ "${PAPER_AGENT_CYCLE_HANDOFF_PATH}" = /* ]]
 handoff_dir="${PAPER_AGENT_CYCLE_HANDOFF_PATH%/*}"
@@ -27,7 +36,7 @@ fi
 cycle_at="$(date -u -d '+9 hours' '+%Y-%m-%dT%H:%M:%S+09:00')"
 export PAPER_AGENT_SESSION_ID="${cycle_at%%T*}"
 export PAPER_AGENT_CYCLE_AT="${cycle_at}"
-/srv/agent-workspaces/KronosStock/.venv/bin/python -m ksf.offline_response_bundle_producer
+"${PAPER_AGENT_PYTHON}" -m ksf.offline_response_bundle_producer
 
 handoff_tmp="$(mktemp "${handoff_dir}/.${handoff_name}.XXXXXX")"
 cleanup() { rm -f -- "${handoff_tmp}"; }

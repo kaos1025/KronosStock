@@ -201,6 +201,7 @@ pathlib.Path(os.environ['CONSUMER_RECORD']).write_text(json.dumps({
     bundles = tmp_path / "bundles"; bundles.mkdir()
     handoff = tmp_path / "paper-agent-cycle.env"
     common = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(tmp_path),
+        "PAPER_AGENT_PYTHON": "/usr/bin/python3",
         "DATE_CALLS": str(date_calls), "PAPER_AGENT_BUNDLE_DIR": str(bundles),
         "PAPER_AGENT_KSF_DB_PATH": str(ksf), "PAPER_AGENT_CYCLE_HANDOFF_PATH": str(handoff)}
     producer = {**common, "PAPER_AGENT_BUNDLE_PRODUCER_ENABLED": "true",
@@ -282,6 +283,52 @@ def test_producer_wrapper_disabled_and_does_not_print_payload(tmp_path):
         text=True, capture_output=True, check=False)
     assert disabled.returncode == 0 and disabled.stdout == "response-bundle status=disabled\n"
     assert "symbols" not in disabled.stdout and "offline_deterministic_abstain_reason" not in disabled.stdout
+
+
+def test_paper_agent_wrappers_require_service_accessible_configured_python(tmp_path):
+    producer_text = PRODUCER_WRAPPER.read_text()
+    consumer_text = CONSUMER_WRAPPER.read_text()
+    forbidden = "/srv/agent-workspaces/KronosStock/.venv/bin/python"
+    assert forbidden not in producer_text
+    assert forbidden not in consumer_text
+    assert '"${PAPER_AGENT_PYTHON}" -m ksf.offline_response_bundle_producer' in producer_text
+    assert 'exec "${PAPER_AGENT_PYTHON}" -m strategy.paper_cycle --once' in consumer_text
+
+    producer_env, consumer_env, handoff, _ = _wrapper_fixture(tmp_path)
+    producer_env["PAPER_AGENT_PYTHON"] = "/home/deploy/.local/bin/python"
+    consumer_env["PAPER_AGENT_PYTHON"] = "/home/deploy/.local/bin/python"
+    handoff.write_text(
+        "PAPER_AGENT_SESSION_ID=2026-08-13\n"
+        "PAPER_AGENT_CYCLE_AT=2026-08-13T20:16:08+09:00\n"
+    )
+    handoff.chmod(0o600)
+
+    assert _run_wrapper(PRODUCER_WRAPPER, producer_env, tmp_path).returncode != 0
+    assert _run_wrapper(CONSUMER_WRAPPER, consumer_env, tmp_path).returncode != 0
+    assert not (tmp_path / "producer.json").exists()
+    assert not (tmp_path / "consumer.json").exists()
+
+
+def test_paper_agent_wrappers_reject_python_symlink_resolving_into_home(tmp_path):
+    producer_env, consumer_env, handoff, _ = _wrapper_fixture(tmp_path)
+    python_link = tmp_path / "service-python"
+    python_link.symlink_to("/home/deploy/.local/bin/python")
+    producer_env["PAPER_AGENT_PYTHON"] = str(python_link)
+    consumer_env["PAPER_AGENT_PYTHON"] = str(python_link)
+    handoff.write_text(
+        "PAPER_AGENT_SESSION_ID=2026-08-13\n"
+        "PAPER_AGENT_CYCLE_AT=2026-08-13T20:16:08+09:00\n"
+    )
+    handoff.chmod(0o600)
+
+    produced = _run_wrapper(PRODUCER_WRAPPER, producer_env, tmp_path)
+    consumed = _run_wrapper(CONSUMER_WRAPPER, consumer_env, tmp_path)
+    assert produced.returncode != 0
+    assert consumed.returncode != 0
+    assert "must not resolve through /home" in produced.stderr
+    assert "must not resolve through /home" in consumed.stderr
+    assert not (tmp_path / "producer.json").exists()
+    assert not (tmp_path / "consumer.json").exists()
 
 
 def test_wrappers_share_producer_identity_and_consumer_never_calls_date(tmp_path):
