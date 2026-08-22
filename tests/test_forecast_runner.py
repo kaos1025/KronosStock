@@ -176,6 +176,31 @@ def test_buffer_forecast_omits_none_paths(fake_redis):
     assert pd.to_datetime(payload["generated_at"]) is not None  # offset 포함 ISO 파싱 가능
 
 
+def test_normalize_uses_time_column_before_range_index():
+    """KIS chart.df() 형태(time 컬럼 + RangeIndex)는 time 컬럼을 날짜 index로 써야 한다."""
+    raw = pd.DataFrame(
+        {
+            "time": pd.to_datetime([
+                "2026-08-19 00:00:00+09:00",
+                "2026-08-20 00:00:00+09:00",
+            ]),
+            "open": [251500.0, 257000.0],
+            "high": [254500.0, 273000.0],
+            "low": [246500.0, 252500.0],
+            "close": [247500.0, 271000.0],
+            "volume": [22788552.0, 26095919.0],
+        }
+    )
+
+    normalized = kr_data_fetcher._normalize(raw)
+
+    assert list(normalized.columns) == kr_data_fetcher.OHLCV_COLUMNS
+    assert list(normalized.index.strftime("%Y-%m-%d")) == ["2026-08-19", "2026-08-20"]
+    assert normalized.index.tz is None
+    assert normalized.index.name == "date"
+    assert normalized["amount"].tolist() == [0.0, 0.0]
+
+
 def test_days_resolution_backward_compat(monkeypatch):
     """days: None→config(forecast_lookback_days), 0→그대로(전체), N→그대로(tail N)."""
     captured = {}

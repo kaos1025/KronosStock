@@ -160,12 +160,24 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     """소스별 차이를 표준 스키마로 통일한다."""
     out = df.copy()
     out.columns = [str(c).lower() for c in out.columns]
+
+    # python-kis chart.df()는 날짜를 index가 아니라 `time` 컬럼으로 반환하고
+    # index는 RangeIndex(0, 1, 2...)일 수 있다. RangeIndex를 그대로 날짜 변환하면
+    # epoch 기반 1970-01-01로 깨지므로, 명시적 시간 컬럼을 우선한다.
+    idx_source = None
+    for date_col in ("time", "date", "datetime"):
+        if date_col in out.columns:
+            idx_source = out.pop(date_col)
+            break
+    if idx_source is None:
+        idx_source = out.index
+
     for col in OHLCV_COLUMNS:
         if col not in out.columns:
             out[col] = 0  # amount 등 누락 시 0
     out = out[OHLCV_COLUMNS].astype(float)
 
-    idx = pd.to_datetime(out.index)
+    idx = pd.DatetimeIndex(pd.to_datetime(idx_source))
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_localize(None)
     out.index = idx.normalize()
